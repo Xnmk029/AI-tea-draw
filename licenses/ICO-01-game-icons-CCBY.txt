@@ -1,0 +1,9 @@
+game-icons.net 图标授权说明
+===========================
+来源：https://game-icons.net/（SVG 经 GitHub 仓库 game-icons/icons 拉取）
+授权：Creative Commons CC BY 3.0 —— https://creativecommons.org/licenses/by/3.0/
+  必须署名各图标作者（Delapouite / Lorc / Badges / DarkZaitzev）。
+  署名明细见 CREDITS.md 中 ICO-01 各行（每个图标对应的作者与来源页）。
+获取日期：2026-10-05
+处理：去除原 fill，改为 currentColor；文件名 ico-<语义名>.svg。
+说明：game-icons.net 素材为过渡方案，正式版计划以定制手绘图标替换。

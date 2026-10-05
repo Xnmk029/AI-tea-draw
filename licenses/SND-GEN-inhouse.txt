@@ -1,0 +1,11 @@
+程序化合成音频说明
+==================
+以下文件由项目脚本（xorshift 噪声 + 一阶滤波 + 包络，node 生成 WAV 后转 OGG/Opus）生成，
+属本项目自有素材，可视为 CC0 / 项目所有：
+
+  - sfx/sfx-gen-brush-loop.ogg    pen.agent：毛笔行笔循环（低通噪声 + 每秒起伏）
+  - sfx/sfx-gen-pencil-loop.ogg   pen.human：铅笔沙沙循环（高通噪声 + 抖动）
+  - amb/amb-gen-room-tone.ogg     amb.teahouse：室内底噪（极轻棕噪）
+
+生成脚本：assets-src/GEN（gen-sfx.mjs 的生成器逻辑）
+生成日期：2026-10-05

@@ -1,0 +1,64 @@
+/* ============================================================
+   字体资产（本地 woff2 子集）——在 ui.css 之后加载
+   FNT-01 正文 霞鹜文楷 / FNT-02 标题 思源宋体 Heavy /
+   FNT-03 书法 马善政（Logo·印章·卷帘）/ FNT-05 等宽 JetBrains Mono
+   ============================================================ */
+@font-face {
+  font-family: 'LXGW WenKai';
+  src: url('/assets/fonts/lxgw-wenkai-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'LXGW WenKai';
+  src: url('/assets/fonts/lxgw-wenkai-medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Source Han Serif CN';
+  src: url('/assets/fonts/source-han-serif-cn-heavy.woff2') format('woff2');
+  font-weight: 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Ma Shan Zheng';
+  src: url('/assets/fonts/ma-shan-zheng.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/assets/fonts/jetbrains-mono-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/assets/fonts/jetbrains-mono-bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font: 'LXGW WenKai', 'MiSans', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-title: 'Source Han Serif CN', 'LXGW WenKai', var(--font-disp);
+  --mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+}
+
+/* 大标题统一走思源宋体 Heavy；书法体 --font-disp 收敛到 Logo / 印章 / 卷帘 / 选中章 */
+.home-title h1,
+.sheet-head h2,
+.sheet-head.row h2,
+.result-title h2,
+.tt-center b,
+.mt-text b,
+.mm-text b {
+  font-family: var(--font-title);
+}

@@ -1,0 +1,10 @@
+Poly Haven 材质授权说明
+=======================
+来源：https://polyhaven.com/
+涉及素材：wood_table_001、wood_table（仅取 Diffuse/Color 贴图）
+授权：Creative Commons CC0 1.0（公共领域）
+官方声明：https://polyhaven.com/license
+  "All content on Poly Haven is released under CC0" —— 可商用、可修改、无需署名
+获取方式：https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/<id>/<id>_diff_1k.jpg
+获取日期：2026-10-05
+处理：调色（深胡桃色/中棕色）、缩放 1024px、转 webp。

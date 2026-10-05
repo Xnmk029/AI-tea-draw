@@ -1,0 +1,11 @@
+ambientCG 材质授权说明
+=====================
+来源：https://ambientcg.com/
+涉及素材：Paper006、Paper002、WoodFloor051、Fabric019
+授权：Creative Commons CC0 1.0 Universal（公共领域）
+官方声明：https://ambientcg.com/ 页脚及 https://docs.ambientcg.com/license/
+  "All materials on ambientCG are provided under the Creative Commons
+   CC0 1.0 Universal License." —— 可商用、可修改、无需署名
+获取方式：https://ambientcg.com/get?file=<ID>_1K-JPG.zip
+获取日期：2026-10-05
+处理：取 Color 贴图，调色（提亮/降饱和/转色调）、缩放至 1024px、转 webp。

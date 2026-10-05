@@ -1,0 +1,13 @@
+Kevin MacLeod（incompetech）音乐授权说明
+=======================================
+来源：https://incompetech.com/
+涉及曲目：
+  - Shenyang            -> music/music-incompetech-shenyang.ogg        （music.menu）
+  - Eastern Thought     -> music/music-incompetech-eastern-thought.ogg （music.tea）
+  - Ashton Manor        -> music/music-incompetech-ashton-manor-sting.ogg（music.result，截取前 12s 淡出）
+授权：Creative Commons Attribution 4.0 —— https://creativecommons.org/licenses/by/4.0/
+署名要求（必须保留）：
+  "<曲名>" Kevin MacLeod (incompetech.com)
+  Licensed under Creative Commons: By Attribution 4.0 License
+获取日期：2026-10-05
+处理：转码 OGG/Opus 128k；Ashton Manor 截取前 12 秒并淡出。

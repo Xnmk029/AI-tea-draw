@@ -1,0 +1,95 @@
+/* ============================================================
+   素材挂载（ASSETS.md §3.1）——在 ui.css / fonts.css 之后加载
+   只覆盖背景 / 纹理相关属性，不动布局与交互
+   ============================================================ */
+:root {
+  --tex-paper: url('/assets/textures/paper/paper-ambientcg-paper006-1k.webp');
+  --tex-paper-2: url('/assets/textures/paper/paper-ambientcg-paper002-1k.webp');
+  --tex-wood-frame: url('/assets/textures/wood/wood-polyhaven-table001-1k.webp');
+  --tex-wood-table: url('/assets/textures/wood/wood-polyhaven-table-1k.webp');
+  --tex-wood-floor: url('/assets/textures/wood/wood-ambientcg-woodfloor051-1k.webp');
+  --tex-fabric: url('/assets/textures/fabric/fabric-ambientcg-fabric019-1k.webp');
+}
+
+/* ---------- 画布纸底：替换 feTurbulence 程序噪点 ---------- */
+.stage {
+  background-color: var(--paper);
+  background-image: var(--tex-paper);
+  background-size: 512px;
+}
+
+/* ---------- 木桌边框：真实木纹环形框（双层 mask 只露边框带） ---------- */
+.table-frame {
+  border-color: transparent;
+}
+.table-frame::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 24px solid transparent;
+  background: var(--tex-wood-frame);
+  background-size: 512px;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* ---------- 左侧笔架：木纹 + 明暗渐变 ---------- */
+.brush-rack {
+  background:
+    linear-gradient(165deg, rgba(255, 236, 200, 0.1), rgba(0, 0, 0, 0.28)),
+    var(--tex-wood-frame);
+  background-size: auto, 384px;
+}
+
+/* ---------- 大厅：木地板底纹 + 茶桌桌面 + 茶席垫 ---------- */
+.lobby-floor {
+  background-image: var(--tex-wood-floor);
+  background-size: 720px;
+  opacity: 0.32;
+}
+.tea-table {
+  background:
+    radial-gradient(ellipse at 40% 35%, rgba(255, 230, 190, 0.16), rgba(0, 0, 0, 0.26) 78%),
+    var(--tex-wood-table);
+  background-size: auto, 640px;
+}
+.tt-center {
+  background-color: var(--paper-sheet);
+  background-image: var(--tex-fabric);
+  background-blend-mode: multiply;
+  background-size: 360px;
+}
+
+/* ---------- 纸面类面板统一铺宣纸纹 ---------- */
+.sheet,
+.home-scene,
+.curtain-paper {
+  background-image: var(--tex-paper);
+  background-blend-mode: multiply;
+  background-size: 512px;
+}
+.sheet {
+  background-color: var(--paper-sheet);
+}
+.home-scene {
+  background-color: #fffdf7;
+}
+.curtain-paper {
+  background-color: var(--paper);
+}
+
+/* 小组件也带一点纸纹 */
+.toast,
+.pet-bubble,
+.seat-bubble,
+.mark-tag,
+.anchor-wheel,
+.rules-sheet,
+.room-code {
+  background-image: var(--tex-paper);
+  background-blend-mode: multiply;
+  background-size: 420px;
+}

@@ -1,0 +1,7 @@
+node_modules
+dist
+*.log
+.shots
+assets-src/
+# 素材原始包（百 MB 级，成品在 public/assets）
+assets-src/
