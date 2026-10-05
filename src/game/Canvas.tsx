@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as RPointerEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as RPointerEvent } from 'react'
 import { Check, Move, Pencil, ShieldCheck, Stamp, X } from 'lucide-react'
 import type { Op, SvgEl, Transform } from '../core/types'
 import { normRect, pointsToPath, r1, tfStr, type Pt } from '../core/geometry'
@@ -8,9 +8,15 @@ import { renderEl } from '../components/renderEl'
 import { AgentGlyph } from '../components/AgentGlyph'
 import { AgentTip, HumanTip } from '../components/CursorTips'
 import { stageScale } from '../ui/stage'
+import { LazyBrush } from 'lazy-brush'
+import { InkWash } from './InkWash'
+import { InkBake } from './InkBake'
+import { memo } from 'react'
+
+type DPt = Pt & { p?: number }
 
 type Draft =
-  | { kind: 'pen'; pts: Pt[] }
+  | { kind: 'pen'; pts: DPt[] }
   | { kind: 'line' | 'rect' | 'ellipse'; a: Pt; b: Pt }
   | { kind: 'guide'; pts: Pt[]; opId: string | null }
   | { kind: 'pan'; sx: number; sy: number; cx: number; cy: number }
@@ -47,6 +53,10 @@ export function Canvas({ g }: { g: GameState }) {
   const [hover, setHover] = useState<{ op: Op; x: number; y: number } | null>(null)
   const [wheel, setWheel] = useState<{ op: Op; x: number; y: number } | null>(null)
   const activeTool = spaceDown ? 'hand' : tool
+  const lazyRef = useRef<LazyBrush | null>(null)
+  // 已烘焙进位图层的 op：SVG 只留透明命中线（InkBake 上报）
+  const [bakedIds, setBakedIds] = useState<Set<string>>(new Set())
+  const onBaked = useCallback((ids: Set<string>) => setBakedIds(ids), [])
 
   const toWorld = (cx: number, cy: number): Pt => {
     const r = svgRef.current!.getBoundingClientRect()
@@ -168,7 +178,12 @@ export function Canvas({ g }: { g: GameState }) {
     if (readOnly) return
     setHover(null)
     capture()
-    if (activeTool === 'pen') setDraft({ kind: 'pen', pts: [p] })
+    if (activeTool === 'pen') {
+      // lazy-brush 牵绳平滑：笔锋滞后半步，人画的线才有"笔意"
+      const lb = new LazyBrush({ radius: Math.max(2.4, 3.4 / cam.z), enabled: true, initialPoint: { x: p.x, y: p.y } })
+      lazyRef.current = lb
+      setDraft({ kind: 'pen', pts: [{ x: p.x, y: p.y, p: e.pressure || 0.5 }] })
+    }
     else if (activeTool === 'guide') {
       const opId = document.elementFromPoint(e.clientX, e.clientY)?.closest('[data-op]')?.getAttribute('data-op') ?? null
       setDraft({ kind: 'guide', pts: [p], opId })
@@ -189,7 +204,16 @@ export function Canvas({ g }: { g: GameState }) {
     }
     const p = toWorld(e.clientX, e.clientY)
     switch (draft.kind) {
-      case 'pen':
+      case 'pen': {
+        const lb = lazyRef.current
+        if (!lb) break
+        lb.update({ x: p.x, y: p.y })
+        const b = lb.getBrushCoordinates()
+        const last = draft.pts[draft.pts.length - 1]
+        if (Math.hypot(b.x - last.x, b.y - last.y) * cam.z < 2.2) return
+        setDraft({ ...draft, pts: [...draft.pts, { x: b.x, y: b.y, p: e.pressure || 0.5 }] })
+        break
+      }
       case 'guide': {
         const last = draft.pts[draft.pts.length - 1]
         if (Math.hypot(p.x - last.x, p.y - last.y) * cam.z < 2.5) return
@@ -223,6 +247,7 @@ export function Canvas({ g }: { g: GameState }) {
   const onUp = (e: RPointerEvent<SVGSVGElement>) => {
     if (!draft) return
     setDraft(null)
+    lazyRef.current = null
     if (draft.kind === 'guide') {
       finishGuide(draft, e)
       return
@@ -289,7 +314,9 @@ export function Canvas({ g }: { g: GameState }) {
   })()
 
   return (
-    <div className={`canvas-wrap tool-${activeTool} ${draft?.kind === 'pan' ? 'panning' : ''} ${readOnly ? 'readonly' : ''}`}>
+    <div className={`canvas-wrap tool-${activeTool} ${draft?.kind === 'pan' ? 'panning' : ''} ${readOnly ? 'readonly' : ''} ${highlightAgent ? 'hl' : ''}`}>
+      <InkWash ops={ops} cam={cam} hiddenSeats={hiddenSeats} />
+      <InkBake ops={ops} cam={cam} hiddenSeats={hiddenSeats} onBaked={onBaked} />
       <svg
         ref={svgRef}
         className="canvas"
@@ -314,13 +341,7 @@ export function Canvas({ g }: { g: GameState }) {
         <g transform={world}>
           {frame && <rect className="frame-card" x={frame.x} y={frame.y} width={frame.w} height={frame.h} rx="10" />}
           <g clipPath={frame ? 'url(#frame-clip)' : undefined} className={highlightAgent ? 'ops hl' : 'ops'}>
-            {ops.map((op) =>
-              hiddenSeats.has(op.seat) ? null : (
-                <g key={op.id} transform={tfStr(op.tf)} className={`op op-${op.author}`}>
-                  {renderEl(op.el, opProps(op))}
-                </g>
-              ),
-            )}
+            {ops.map((op) => (hiddenSeats.has(op.seat) ? null : <OpNode key={op.id} op={op} baked={bakedIds.has(op.id)} />))}
           </g>
           {thinking.map((t) => (
             <g key={t.key} transform={`translate(${t.at.x} ${t.at.y})`} className="think" style={{ '--c': t.color } as CSSProperties}>
@@ -589,6 +610,15 @@ function opProps(op: Op) {
   return extra
 }
 
+/** 单 op 节点：memo 之后 draft 拖动不再整树重渲所有笔迹 */
+const OpNode = memo(function OpNode({ op, baked }: { op: Op; baked: boolean }) {
+  return (
+    <g transform={tfStr(op.tf)} className={`op op-${op.author}`}>
+      {renderEl(op.el, baked ? { 'data-op': op.id, hitOnly: true } : { ...opProps(op), seed: op.id })}
+    </g>
+  )
+})
+
 const strokeBase = (color: string, width: number) => ({
   fill: 'none',
   stroke: color,
@@ -601,7 +631,9 @@ function finalize(d: Draft, color: string, width: number): SvgEl | null {
   const base = strokeBase(color, width)
   if (d.kind === 'pen') {
     if (d.pts.length === 1) return { tag: 'circle', attrs: { cx: r1(d.pts[0].x), cy: r1(d.pts[0].y), r: width / 2, fill: color } }
-    return { tag: 'path', attrs: { d: pointsToPath(d.pts), ...base } }
+    // 真实笔压随路径一起存进 Op（数位板有效，鼠标恒 0.5，渲染端再叠包络出锋）
+    const pp = d.pts.map((q) => Math.round((q.p ?? 0.5) * 100) / 100).join(',')
+    return { tag: 'path', attrs: { d: pointsToPath(d.pts), 'data-pp': pp, ...base } }
   }
   if (d.kind === 'line') {
     if (Math.hypot(d.a.x - d.b.x, d.a.y - d.b.y) < 3) return null

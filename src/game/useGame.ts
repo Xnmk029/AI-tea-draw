@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ActivityItem, AgentStatus, ChatMsg, GuessRole, ModeId, Op, RoomRules, Seat, SvgEl, ToolId, Transform } from '../core/types'
 import { clamp, STAGE, type Pt, type Rect } from '../core/geometry'
-import { PALETTE } from '../core/theme'
-import { measureLength } from '../core/svgPolicy'
+import { PALETTE, SEAT_COLORS } from '../core/theme'
+import { ALLOWED_TAGS, measureLength } from '../core/svgPolicy'
 import { DRAWINGS, drawingReport, matchDrawing, type DrawingKey } from '../mock/drawings'
 import {
-  GUESS_DRAWER_SEAT, GUESSER_TARGET, RELAY_FRAME, RELAY_PROMPT, RELAY_STEP, ROOM_CODE, TEA_THEME,
-  judgeGuess, pickOptions, pickTarget, whisperFor, wordPool,
+  GUESS_DRAWER_SEAT, GUESSER_TARGET, RELAY_FRAME, RELAY_STEP, ROOM_CODE, TEA_THEME,
+  judgeGuess, pickOptions, pickTarget, whisperFor,
 } from '../mock/room'
+import { guessPool, pickRelayTitle } from '../mock/prompts'
 import {
   MAX_MARKS, type Camera, type GameState, type Ghost, type GuideMode, type Pen, type SessionResult,
-  type Think, type Toast, type UseGameOptions, type WordOption,
+  type Think, type Toast, type UseGameOptions, type WordOption, type RelayChain, type RelayTurn,
 } from './gameTypes'
 import { animateOps, buildBatch, elStart, makePen, mergeBatches, nowTime, uid, type Batch } from './engine'
 import {
@@ -20,6 +21,7 @@ import {
 import { agentPenKey, simRoundStart, startSimulation, type SimCtx } from './simulation'
 import { attachLiveAgent, type LiveCtx, type LiveHandle } from './liveAgent'
 import type { LivePeer } from './mcpClient'
+import { connectNet, type NetLink, type RoomMsg } from './netSync'
 
 const SIDEBAR = 324
 const ORIGIN: Transform = { x: 0, y: 0, s: 1 }
@@ -41,7 +43,7 @@ function initCam(frame?: Rect): Camera {
   return { x: frame.x + frame.w / 2 - vc.x / z, y: frame.y + frame.h / 2 - vc.y / z, z }
 }
 
-function initialChat(mode: ModeId, role: GuessRole, rules: RoomRules, seats: Seat[]): ChatMsg[] {
+function initialChat(mode: ModeId, role: GuessRole, rules: RoomRules, seats: Seat[], relayTitle: string): ChatMsg[] {
   const sys = (text: string): ChatMsg => ({ id: uid('m'), seat: null, author: 'system', text })
   const name = (id: number) => seats.find((s) => s.id === id)?.name ?? `玩家${id}`
   if (mode === 'tea') {
@@ -54,7 +56,7 @@ function initialChat(mode: ModeId, role: GuessRole, rules: RoomRules, seats: Sea
   if (mode === 'relay') {
     return [
       sys(`图文传话 · 第 ${RELAY_STEP.current}/${RELAY_STEP.total} 步：根据上一位的文字作画`),
-      sys(`题目：「${RELAY_PROMPT}」`),
+      sys(`题目：「${relayTitle}」`),
       sys(`只有画框内的内容会传给下一位，限时 ${rules.roundTime} 秒，时间到会自动提交`),
     ]
   }
@@ -77,10 +79,64 @@ const hasKeyword = (text: string) => Object.values(DRAWINGS).some((d) => d.keywo
 export function useGame(opts: UseGameOptions): GameState {
   const init = useRef(opts).current
   const { mode, rules } = init
-  const role = init.guessRole
-  const readOnly = mode === 'guess' && role === 'guesser'
+  const roleProp = init.guessRole
   const frame = mode === 'relay' ? RELAY_FRAME : undefined
   const meId = (init.seats.find((s) => s.isMe) ?? init.seats[0]).id
+
+  // ---------- 图文传话链：每座位同时派多个题目，减少真空期 ----------
+  const RELAY_STEP_COUNT = 3
+  const CHAINS_PER_SEAT = 3
+  function buildRelayChains(seats: Seat[], player: number, roomRules: RoomRules): { chains: RelayChain[]; queue: RelayTurn[] } {
+    const active = seats.filter((s) => s.online).map((s) => s.id)
+    const chains: RelayChain[] = []
+    for (const starter of active) {
+      for (let c = 0; c < CHAINS_PER_SEAT; c++) {
+        const prompt = pickRelayTitle(roomRules)
+        const starterIdx = active.indexOf(starter)
+        const steps = Array.from({ length: RELAY_STEP_COUNT }, (_, step) => {
+          const seat = active[(starterIdx + step) % active.length]
+          return { step, seat, prompt, ops: [] as Op[], done: false }
+        })
+        chains.push({ id: uid('chain'), starter, steps })
+      }
+    }
+    const queue: RelayTurn[] = chains
+      .filter((chain) => chain.steps[0].seat === player)
+      .map((chain) => ({ chainId: chain.id, stepIdx: 0, prompt: chain.steps[0].prompt }))
+    return { chains, queue }
+  }
+  const relayInit = useRef(buildRelayChains(init.seats, meId, rules)).current
+
+  // ---------- 联机（netSync；茶绘+你画我猜已接，传话等 P4） ----------
+  const netParams = init.net
+  const netRef = useRef<NetLink | null>(null)
+  /** peer 被 host 分配的座位（host/单机为 null → 用 meId） */
+  const [netSeat, setNetSeat] = useState<number | null>(null)
+  const netSeatRef = useRef<number | null>(null)
+  const [netView, setNetView] = useState<GameState['net']>(undefined)
+  /** host 侧：peerId → 座位 id / 名字 */
+  const peerSeats = useRef(new Map<string, number>())
+  const peerNames = useRef(new Map<string, string>())
+  /** host 广播来的结算载荷（peer 端据此跳结算屏） */
+  const [netResult, setNetResult] = useState<SessionResult | null>(null)
+  /** 本轮计时终点（host 发 endsAt 时间戳；peer 据此本地倒计时） */
+  const endsAtRef = useRef(0)
+  /** peer 猜词者的题目长度（词本体不下发，host 判词） */
+  const [netHintLen, setNetHintLen] = useState(0)
+
+  /** 本轮画手座位（state + ref 镜像；net 模式下随 round-start 轮换 → 决定本地画还是猜） */
+  const [drawerSeatS, setDrawerSeatS] = useState<number>(
+    netParams ? meId : mode === 'guess' && roleProp === 'guesser' ? GUESS_DRAWER_SEAT : meId,
+  )
+  const drawerSeat = useRef(drawerSeatS)
+  const setDrawerNow = (id: number) => {
+    drawerSeat.current = id
+    setDrawerSeatS(id)
+  }
+  /** 联机时我的真实座位；单机恒为 meId */
+  const mySeat = netSeat ?? meId
+  const role: GuessRole = mode === 'guess' && netParams ? (mySeat === drawerSeatS ? 'drawer' : 'guesser') : roleProp
+  const readOnly = mode === 'guess' && (netParams ? mySeat !== drawerSeatS : roleProp === 'guesser')
 
   // ?resume=1 恢复上一次未完成的画布与比分（刷新/崩溃救场用）
   const resumeData = useMemo(() => {
@@ -113,7 +169,8 @@ export function useGame(opts: UseGameOptions): GameState {
   const [tool, setTool] = useState<ToolId>(readOnly ? 'hand' : 'pen')
   const [color, setColor] = useState(PALETTE[0])
   const [width, setWidth] = useState(4)
-  const [chat, setChat] = useState<ChatMsg[]>(() => initialChat(mode, role, rules, init.seats))
+  const firstRelayTitle = relayInit.queue[0]?.prompt ?? ''
+  const [chat, setChat] = useState<ChatMsg[]>(() => initialChat(mode, role, rules, init.seats, firstRelayTitle))
   const [activity, setActivity] = useState<ActivityItem[]>([])
   const [toast, setToast] = useState<Toast | null>(null)
   const [highlightAgent, setHighlightAgent] = useState(false)
@@ -126,9 +183,16 @@ export function useGame(opts: UseGameOptions): GameState {
   const [guessedSeats, setGuessedSeats] = useState<number[]>([])
   const [whisper, setWhisper] = useState<string | null>(null)
   const [roundOver, setRoundOver] = useState(false)
-  const [othersDone, setOthersDone] = useState(mode === 'relay' ? 2 : 0)
-  const [submitted, setSubmitted] = useState(false)
   const [live, setLive] = useState<LivePeer>({ state: 'connecting' })
+
+  // ---------- 传话链状态（多题同派） ----------
+  const [relayChains, setRelayChains] = useState<RelayChain[]>(() => relayInit.chains)
+  const [relayQueue, setRelayQueue] = useState<RelayTurn[]>(() => relayInit.queue)
+  const [relayTurn, setRelayTurn] = useState<RelayTurn | null>(() => relayInit.queue[0] ?? null)
+  const [submitted, setSubmitted] = useState(false)
+  const relayTitle = relayTurn?.prompt ?? relayQueue[0]?.prompt ?? ''
+  const relayDone = useMemo(() => relayChains.reduce((n, c) => n + c.steps.filter((s) => s.done).length, 0), [relayChains])
+  const relayTotal = relayChains.length * RELAY_STEP_COUNT
 
   // ---------- 局进度 ----------
   const [round, setRound] = useState(resumeData?.round ?? 1)
@@ -136,16 +200,15 @@ export function useGame(opts: UseGameOptions): GameState {
   const isLastRound = round >= roundsTotal
   /** 猜词视角的本轮题目（drawer 视角的题目在 word 里） */
   const [roundTarget, setRoundTarget] = useState<WordOption>(GUESSER_TARGET)
-  const [wordOptions, setWordOptions] = useState<WordOption[]>(() => pickOptions(wordPool(rules), 3))
+  const [wordOptions, setWordOptions] = useState<WordOption[]>(() => pickOptions(guessPool(rules), 3))
   const usedWords = useRef(new Set<string>([GUESSER_TARGET.word]))
   /** 每座位累计猜中数（跨轮累计，结算用） */
   const guessCount = useRef(new Map<number, number>())
-  /** 本轮画手座位（猜词视角按轮换，画手视角恒为我） */
-  const drawerSeat = useRef(readOnly ? GUESS_DRAWER_SEAT : meId)
+  /** 本轮画手座位（声明已上移到联机块——net 模式下需早于 readOnly 推导） */
   const startedAt = useRef(Date.now())
   const simCtxRef = useRef<SimCtx | null>(null)
 
-  const me = seats.find((s) => s.id === meId) ?? seats[0]
+  const me = seats.find((s) => s.id === (netSeat ?? meId)) ?? seats[0]
   const answer = readOnly ? roundTarget.word : word?.word ?? ''
 
   const ink = useMemo(() => {
@@ -162,8 +225,8 @@ export function useGame(opts: UseGameOptions): GameState {
   }, [ops, meId, rules.inkRatio])
 
   // 最新状态快照，供稳定回调读取
-  const S = useRef({ seats, ops, ghost, marks, cam, word, guessed, roundOver, submitted, timeLeft, ink, answer, live, round, roundTarget })
-  S.current = { seats, ops, ghost, marks, cam, word, guessed, roundOver, submitted, timeLeft, ink, answer, live, round, roundTarget }
+  const S = useRef({ seats, ops, ghost, marks, foreignMarks, cam, word, guessed, roundOver, submitted, timeLeft, ink, answer, live, round, roundTarget, relayTurn, relayQueue, relayChains })
+  S.current = { seats, ops, ghost, marks, foreignMarks, cam, word, guessed, roundOver, submitted, timeLeft, ink, answer, live, round, roundTarget, relayTurn, relayQueue, relayChains }
 
   // ---------- 计时器 ----------
   const timers = useRef(new Set<number>())
@@ -195,6 +258,25 @@ export function useGame(opts: UseGameOptions): GameState {
   }, [])
 
   const say = useCallback((msg: Omit<ChatMsg, 'id'>) => setChat((c) => [...c.slice(-199), { id: uid('m'), ...msg }]), [])
+
+  /** host 广播一条 sys/聊天消息（本地 say + 远端 chat 包），net 关闭时只 say */
+  const sayAll = useCallback(
+    (msg: Omit<ChatMsg, 'id'>) => {
+      say(msg)
+      const net = netRef.current
+      if (net?.role === 'host') net.broadcast({ t: 'chat', msg: { id: uid('m'), ...msg } })
+    },
+    [say],
+  )
+
+  /** host：当前比分表广播（peer 端据此刷 seats 比分；extra=未落账的增量） */
+  const pushScores = useCallback((extra?: [number, number][]) => {
+    const net = netRef.current
+    if (net?.role !== 'host') return
+    const cur = new Map(S.current.seats.map((s) => [s.id, s.score] as [number, number]))
+    for (const [id, d] of extra ?? []) cur.set(id, (cur.get(id) ?? 0) + d)
+    net.broadcast({ t: 'scores', map: [...cur] })
+  }, [])
 
   const patchAgent = useCallback((seatId: number, status: AgentStatus) => {
     setSeats((ss) => ss.map((s) => (s.id === seatId && s.agent ? { ...s, agent: { ...s.agent, status } } : s)))
@@ -241,8 +323,18 @@ export function useGame(opts: UseGameOptions): GameState {
     if (S.current.roundOver) return
     setRoundOver(true)
     const a = S.current.answer
-    say({ seat: null, author: 'system', text: a ? `本轮结束，答案是「${a}」` : '本轮结束' })
-  }, [say])
+    const text = a ? `本轮结束，答案是「${a}」` : '本轮结束'
+    sayAll({ seat: null, author: 'system', text })
+    const net = netRef.current
+    if (net?.role === 'host') {
+      net.broadcast({
+        t: 'round-over',
+        answer: a,
+        isLast: S.current.round >= roundsTotal,
+        scores: S.current.seats.map((s) => [s.id, s.score]),
+      })
+    }
+  }, [sayAll, roundsTotal])
 
   const guessedRef = useRef(new Set<number>())
   const markGuessed = useCallback((seatId: number) => {
@@ -259,6 +351,11 @@ export function useGame(opts: UseGameOptions): GameState {
   const nextRound = useCallback(() => {
     const L = S.current
     if (mode !== 'guess' || !L.roundOver || L.round >= roundsTotal) return
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'next-req' })
+      return
+    }
     const r = L.round + 1
     setRound(r)
     setOps([])
@@ -277,8 +374,26 @@ export function useGame(opts: UseGameOptions): GameState {
     setTimeLeft(rules.roundTime)
     setRoundOver(false)
     say({ seat: null, author: 'system', text: `第 ${r}/${roundsTotal} 轮开始` })
-    const pool = wordPool(rules)
+    const pool = guessPool(rules)
     const used = [...usedWords.current]
+    if (net?.role === 'host') {
+      // 联机轮换：画手沿 roster 座位顺序轮转（host 的 seats 即 roster）；新画手是 peer → 定向发词卡
+      const ids = S.current.seats.map((s) => s.id)
+      const idx = ids.indexOf(drawerSeat.current)
+      const nextSeat = ids[(idx + 1) % ids.length] ?? meId
+      setDrawerNow(nextSeat)
+      setRoundTarget({ ...GUESSER_TARGET, word: '' })
+      endsAtRef.current = 0
+      net.broadcast({ t: 'round-start', round: r, drawerSeat: nextSeat, hintLen: 0, endsAt: 0 })
+      const drawerPeer = [...peerSeats.current.entries()].find(([, sid]) => sid === nextSeat)?.[0]
+      const opts = pickOptions(pool, 3, used)
+      if (drawerPeer) {
+        net.to(drawerPeer, { t: 'word-offer', options: opts })
+      } else {
+        setWordOptions(opts)
+      }
+      return
+    }
     if (readOnly) {
       const t = pickTarget(pool, used)
       usedWords.current.add(t.word)
@@ -288,7 +403,7 @@ export function useGame(opts: UseGameOptions): GameState {
     }
     simRoundStart(simCtxRef.current, r)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, readOnly, rules, roundsTotal, say])
+  }, [mode, readOnly, rules, roundsTotal, say, meId])
 
   const collectResult = useCallback((): SessionResult => {
     const L = S.current
@@ -307,44 +422,77 @@ export function useGame(opts: UseGameOptions): GameState {
       guessStats:
         mode === 'guess' ? L.seats.map((s) => ({ seat: s.id, correct: guessCount.current.get(s.id) ?? 0, drawn: drew.has(s.id) ? 1 : 0 })) : undefined,
       rounds: L.round,
-      theme: mode === 'tea' ? rules.theme || TEA_THEME : mode === 'relay' ? RELAY_PROMPT : undefined,
+      theme: mode === 'tea' ? rules.theme || TEA_THEME : mode === 'relay' ? (L.relayTurn?.prompt ?? '') : undefined,
+      relayChains: mode === 'relay' ? L.relayChains : undefined,
       startedAt: startedAt.current,
       durationMs: Date.now() - startedAt.current,
     }
   }, [mode, rules])
 
+  /** 结束整局：host 结算+广播 session-over 返回载荷；peer 发 end-req 等广播（返回 null 由 netResult 兜） */
+  const requestFinish = useCallback((): SessionResult | null => {
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'end-req' })
+      return null
+    }
+    const r = collectResult()
+    net?.broadcast({ t: 'session-over', result: r })
+    return r
+  }, [collectResult])
+
   // ---------- 绘制 / 擦除 / 撤销 ----------
   const redoStack = useRef<Op[]>([])
 
   const draw = useCallback((el: SvgEl) => {
-    if (readOnly || S.current.roundOver || (mode === 'relay' && S.current.submitted)) return
+    if (readOnly || S.current.roundOver || (mode === 'relay' && (!relayTurn || S.current.submitted))) return
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'op', el })
+      return
+    }
     const op: Op = { id: uid('op'), seat: meId, author: 'human', el, tf: ORIGIN, ink: Math.round(measureLength(el)) }
     redoStack.current = []
     setOps((p) => [...p, op])
     liveRef.current?.notifyOps([op])
-  }, [readOnly, mode, meId])
+    net?.broadcast({ t: 'ops', ops: [op] })
+  }, [readOnly, mode, meId, relayTurn])
 
   const erase = useCallback((opId: string) => {
     if (readOnly) return
     const op = S.current.ops.find((o) => o.id === opId)
     if (!op) return
-    if (op.seat !== meId) {
+    const mine = netSeatRef.current ?? meId
+    if (op.seat !== mine) {
       const text = '只能擦除自己（和自己 Agent）的笔迹'
       if (lastToast.current.text !== text || Date.now() - lastToast.current.at > 1500) showToast(text)
       return
     }
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'op-erase', id: opId })
+      return
+    }
     setOps((p) => p.filter((o) => o.id !== opId))
     liveRef.current?.notifyOpsRemoved([opId])
+    net?.broadcast({ t: 'op-del', ids: [opId] })
   }, [readOnly, meId, showToast])
 
   const undo = useCallback(() => {
+    const mine = netSeatRef.current ?? meId
     const list = S.current.ops
     for (let i = list.length - 1; i >= 0; i--) {
-      if (list[i].seat !== meId) continue
+      if (list[i].seat !== mine) continue
       const op = list[i]
       redoStack.current.push(op)
+      const net = netRef.current
+      if (net?.role === 'peer') {
+        net.intent({ t: 'op-erase', id: op.id })
+        return
+      }
       setOps((p) => p.filter((o) => o.id !== op.id))
       liveRef.current?.notifyOpsRemoved([op.id])
+      net?.broadcast({ t: 'op-del', ids: [op.id] })
       return
     }
   }, [meId])
@@ -352,8 +500,14 @@ export function useGame(opts: UseGameOptions): GameState {
   const redo = useCallback(() => {
     const op = redoStack.current.pop()
     if (!op) return
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'op', el: op.el, tf: op.tf })
+      return
+    }
     const { anim: _a, ...rest } = op
     setOps((p) => [...p, rest])
+    net?.broadcast({ t: 'ops', ops: [rest] })
   }, [])
 
   // ---------- 我的 Agent ----------
@@ -392,6 +546,7 @@ export function useGame(opts: UseGameOptions): GameState {
     if (L.roundOver) return showToast('本轮已结束')
     if (mode === 'guess' && !L.word) return showToast('先选一个词')
     if (mode === 'relay' && L.submitted) return showToast('已经提交，等待其他人')
+    if (mode === 'relay' && !relayTurn) return showToast('当前没有待作画的题目')
     const liveOn = L.live?.state === 'ready' || L.live?.state === 'awake'
     // 真实链路下：草稿待审时仍阻塞；Agent 思考中的旧任务允许被新指令覆盖
     if (L.ghost || (!liveOn && (busy.current || self.agent.status !== 'idle'))) return
@@ -473,7 +628,8 @@ export function useGame(opts: UseGameOptions): GameState {
     if (usedMarks.length > 1) notes.push(`指引目标 ×${usedMarks.length}`)
 
     busy.current = true
-    const task = mode === 'tea' ? `茶绘 · 主题「${rules.theme || TEA_THEME}」` : mode === 'relay' ? `传话第 ${RELAY_STEP.current} 步 · 「${RELAY_PROMPT}」` : `你画我猜 · 画手 · 词「${L.word?.word ?? ''}」`
+    const step = relayTurn ? relayTurn.stepIdx + 1 : 1
+    const task = mode === 'tea' ? `茶绘 · 主题「${rules.theme || TEA_THEME}」` : mode === 'relay' ? `传话第 ${step} 棒 · 「${relayTitle}」` : `你画我猜 · 画手 · 词「${L.word?.word ?? ''}」`
     log('turn_get_task', t ? `${task} · 指令「${t}」` : task)
     log('canvas_get_targets', usedMarks.length ? `${usedMarks.length} 个标记（${usedMarks.map((m) => m.target.kind).join('、')}）` : '无标记 · canvas_find_space')
     log('canvas_snapshot', usedMarks.length ? `png · ${usedMarks.length} 个目标周边` : frame ? `png · 画框 ${frame.w}×${frame.h}` : 'png · 视口')
@@ -508,7 +664,7 @@ export function useGame(opts: UseGameOptions): GameState {
         commitOps(animateOps(previewOps, rules.penSpeed))
       }
     })
-  }, [meId, mode, readOnly, frame, rules, showToast, log, patchAgent, think, later, myAgentKey, commitOps])
+  }, [meId, mode, readOnly, frame, rules, showToast, log, patchAgent, think, later, myAgentKey, commitOps, relayTurn, relayTitle])
 
   const acceptGhost = useCallback(() => {
     const g = S.current.ghost
@@ -518,7 +674,13 @@ export function useGame(opts: UseGameOptions): GameState {
     setLastStamp({ at: { x: b.x + b.w / 2, y: b.y + b.h / 2 }, nonce: Date.now() })
     log('preview_accept', `${g.label} · 墨量 ${g.ink}`, 'ok')
     if (g.previewId) liveRef.current?.previewResult('accepted', g.previewId)
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'ops', items: g.ops.map((o) => ({ el: o.el, tf: o.tf })) })
+      return
+    }
     commitOps(animateOps(g.ops, rules.penSpeed))
+    net?.broadcast({ t: 'ops', ops: g.ops })
   }, [log, commitOps, rules.penSpeed])
 
   const rejectGhost = useCallback(() => {
@@ -559,19 +721,462 @@ export function useGame(opts: UseGameOptions): GameState {
     if (readOnly || S.current.roundOver) return
     if (S.current.marks.length >= MAX_MARKS) return showToast(`最多同时指定 ${MAX_MARKS} 处，Esc 清空`)
     const target = frame ? clampTarget(t, frame) : t
-    const color = S.current.seats.find((s) => s.id === meId)?.color ?? '#888'
-    setMarks((m) => [...m, { id: uid('mk'), seat: meId, color, target, createdAt: Date.now() }])
-  }, [readOnly, frame, meId, showToast])
+    const color = S.current.seats.find((s) => s.id === (netSeatRef.current ?? meId))?.color ?? '#888'
+    const mark: TargetMark = { id: uid('mk'), seat: netSeatRef.current ?? meId, color, target, createdAt: Date.now() }
+    setMarks((m) => [...m, mark])
+    const net = netRef.current
+    if (net && rules.targetsPublic) {
+      if (net.role === 'peer') net.intent({ t: 'mark', mark })
+      else net.broadcast({ t: 'mark', mark })
+    }
+  }, [readOnly, frame, meId, showToast, rules.targetsPublic])
 
-  const removeMark = useCallback((id: string) => setMarks((m) => m.filter((x) => x.id !== id)), [])
-  const clearMarks = useCallback(() => setMarks([]), [])
+  const removeMark = useCallback((id: string) => {
+    setMarks((m) => m.filter((x) => x.id !== id))
+    const net = netRef.current
+    if (net && rules.targetsPublic) {
+      if (net.role === 'peer') net.intent({ t: 'mark-del', id })
+      else net.broadcast({ t: 'mark-del', id })
+    }
+  }, [rules.targetsPublic])
+
+  const clearMarks = useCallback(() => {
+    const net = netRef.current
+    if (net && rules.targetsPublic) {
+      for (const m of S.current.marks) {
+        if (net.role === 'peer') net.intent({ t: 'mark-del', id: m.id })
+        else net.broadcast({ t: 'mark-del', id: m.id })
+      }
+    }
+    setMarks([])
+  }, [rules.targetsPublic])
+
+  // ---------- 联机同步（netSync：Host 权威，peer 只发意图等回显） ----------
+  /** host：roster 序列化（seats 只带同步字段；peer 侧自行标 isMe/agent） */
+  const rosterList = useCallback((): Seat[] => {
+    const mine = S.current.seats.find((s) => s.id === meId)
+    const mineNet = mine ? [{ ...mine, isHost: true }] : []
+    const peers = [...peerSeats.current.entries()].map(([pid, sid]) => ({
+      id: sid,
+      name: peerNames.current.get(pid) ?? '茶客',
+      color: SEAT_COLORS[(sid - 1) % SEAT_COLORS.length],
+      ready: true,
+      online: true,
+      score: S.current.seats.find((s) => s.id === sid)?.score ?? 0,
+      agent: null,
+    }))
+    return [...mineNet, ...peers]
+  }, [meId])
+
+  const pushRoster = useCallback(() => {
+    const net = netRef.current
+    if (!net || net.role !== 'host') return
+    const roster = rosterList()
+    setSeats(roster)
+    net.broadcast({ t: 'roster', seats: roster.map((s) => ({ id: s.id, name: s.name, color: s.color, score: s.score, online: s.online, isHost: !!s.isHost })) })
+  }, [rosterList])
+
+  /** peer：按广播比分表刷新 seats */
+  const patchScores = useCallback((map: [number, number][]) => {
+    const m = new Map(map)
+    setSeats((ss) => ss.map((s) => (m.has(s.id) ? { ...s, score: m.get(s.id)! } : s)))
+  }, [])
+
+  /** peer：按 host roster 重建座位表（自己的座位标 isMe + 保留本地茶宠） */
+  const applyRoster = useCallback((list: { id: number; name: string; color: string; score?: number; online?: boolean; isHost?: boolean }[]) => {
+    setSeats(
+      list.map((s) => ({
+        id: s.id,
+        name: s.name,
+        color: s.color,
+        ready: true,
+        online: s.online ?? true,
+        score: s.score ?? 0,
+        isMe: s.id === netSeatRef.current,
+        isHost: s.isHost,
+        agent: s.id === netSeatRef.current ? (init.seats.find((x) => x.isMe)?.agent ?? null) : null,
+      })),
+    )
+  }, [init])
+
+  /** host：校验远端来的 {el,tf} 并落账+广播（轻量白名单 + 墨量上限） */
+  const commitRemote = useCallback((from: string, items: { el: SvgEl; tf?: Transform }[]) => {
+    const seat = peerSeats.current.get(from)
+    if (seat == null || !Array.isArray(items)) return
+    const built: Op[] = []
+    for (const it of items.slice(0, 64)) {
+      const el = it?.el
+      const tf = it?.tf
+      if (!el || !ALLOWED_TAGS.includes(el.tag)) continue
+      if (!el.attrs || typeof el.attrs !== 'object') continue
+      if (Object.values(el.attrs).some((v) => typeof v !== 'string' && typeof v !== 'number')) continue
+      if (tf && (![tf.x, tf.y, tf.s].every((n) => Number.isFinite(n)) || tf.s <= 0 || tf.s > 16)) continue
+      const ink = Math.round(measureLength(el))
+      if (ink > 200_000) continue
+      built.push({ id: uid('op'), seat, author: 'human', el, tf: tf ?? ORIGIN, ink })
+    }
+    if (!built.length) return
+    setOps((p) => [...p, ...built])
+    liveRef.current?.notifyOps(built)
+    netRef.current?.broadcast({ t: 'ops', ops: built })
+  }, [liveRef])
+
+  /** host：成员意图处理 */
+  const hostIntent = useCallback(
+    (from: string, msg: RoomMsg) => {
+      const net = netRef.current
+      switch (msg.t) {
+        case 'hello': {
+          if (!net || peerSeats.current.has(from)) return
+          const used = new Set([meId, ...peerSeats.current.values()])
+          let sid = 1
+          while (used.has(sid)) sid++
+          if (sid > 8) return
+          peerSeats.current.set(from, sid)
+          peerNames.current.set(from, (typeof msg.name === 'string' && msg.name.slice(0, 12)) || '茶客')
+          net.to(from, { t: 'seat-assign', seat: sid, color: SEAT_COLORS[(sid - 1) % SEAT_COLORS.length] })
+          pushRoster()
+          net.to(from, {
+            t: 'snapshot',
+            seats: rosterList().map((s) => ({ id: s.id, name: s.name, color: s.color, score: s.score, online: s.online, isHost: !!s.isHost })),
+            ops: S.current.ops,
+            foreignMarks: rules.targetsPublic ? [...S.current.marks, ...S.current.foreignMarks] : [],
+            round: S.current.round,
+            drawerSeat: drawerSeat.current,
+            hintLen: mode === 'guess' && !S.current.roundOver ? (S.current.answer || '').length : 0,
+            roundOver: S.current.roundOver,
+            answer: S.current.roundOver ? S.current.answer : '',
+            endsAt: endsAtRef.current,
+          })
+          // 新员恰好是本轮画手且未选词 → 定向发词卡
+          if (mode === 'guess' && sid === drawerSeat.current && !S.current.word && !S.current.roundOver) {
+            net.to(from, { t: 'word-offer', options: pickOptions(guessPool(rules), 3, [...usedWords.current]) })
+          }
+          break
+        }
+        case 'pick-word': {
+          const seat = peerSeats.current.get(from)
+          if (seat == null || seat !== drawerSeat.current || S.current.roundOver || S.current.word) return
+          const word = typeof msg.word === 'string' ? msg.word.trim().slice(0, 30) : ''
+          if (!word) return
+          const opt: WordOption = guessPool(rules).find((o) => o.word === word) ?? { word, level: '词库', close: [word.slice(0, 2)], drawing: matchDrawing(word) }
+          setRoundTarget(opt)
+          usedWords.current.add(word)
+          endsAtRef.current = Date.now() + rules.roundTime * 1000
+          const name = S.current.seats.find((s) => s.id === seat)?.name ?? '画手'
+          const sys: ChatMsg = { id: uid('m'), seat: null, author: 'system', text: `${name} 已选定题目，开画！` }
+          setChat((c) => [...c.slice(-199), sys])
+          net?.broadcast({ t: 'chat', msg: sys })
+          net?.broadcast({ t: 'round-live', hintLen: word.length, endsAt: endsAtRef.current })
+          break
+        }
+        case 'guess': {
+          const seat = peerSeats.current.get(from)
+          const L = S.current
+          const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, 60) : ''
+          if (seat == null || !text || L.roundOver || guessedRef.current.has(seat)) return
+          const human: ChatMsg = { id: uid('m'), seat, author: 'human', text }
+          setChat((c) => [...c.slice(-199), human])
+          net?.broadcast({ t: 'chat', msg: human })
+          const r = judgeGuess(text, L.roundTarget)
+          net?.broadcast({ t: 'guess-result', seat, verdict: r })
+          if (r === 'correct') {
+            const base = Math.max(100, Math.round(((L.timeLeft ?? 0) / rules.roundTime) * 300))
+            score(seat, base)
+            score(drawerSeat.current, 40)
+            const name = S.current.seats.find((s) => s.id === seat)?.name ?? '对方'
+            const sys: ChatMsg = { id: uid('m'), seat: null, author: 'system', text: `${name} 猜中了！+${base}`, kind: 'correct' }
+            setChat((c) => [...c.slice(-199), sys])
+            net?.broadcast({ t: 'chat', msg: sys })
+            pushScores([[seat, base], [drawerSeat.current, 40]])
+            markGuessed(seat)
+          } else if (r === 'close') {
+            const sys: ChatMsg = { id: uid('m'), seat: null, author: 'system', text: `「${text}」很接近了`, kind: 'close' }
+            setChat((c) => [...c.slice(-199), sys])
+            net?.broadcast({ t: 'chat', msg: sys })
+          }
+          break
+        }
+        case 'next-req':
+          nextRound()
+          break
+        case 'end-req': {
+          const r = collectResult()
+          net?.broadcast({ t: 'session-over', result: r })
+          setNetResult(r)
+          break
+        }
+        case 'op':
+          commitRemote(from, [msg as unknown as { el: SvgEl; tf?: Transform }])
+          break
+        case 'ops':
+          commitRemote(from, (msg.items as { el: SvgEl; tf?: Transform }[]) ?? [])
+          break
+        case 'op-erase': {
+          const seat = peerSeats.current.get(from)
+          const op = S.current.ops.find((o) => o.id === msg.id)
+          if (seat == null || !op || op.seat !== seat) return
+          setOps((p) => p.filter((o) => o.id !== msg.id))
+          liveRef.current?.notifyOpsRemoved([msg.id as string])
+          net?.broadcast({ t: 'op-del', ids: [msg.id] })
+          break
+        }
+        case 'chat': {
+          const seat = peerSeats.current.get(from)
+          const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, 200) : ''
+          if (seat == null || !text) return
+          const m: ChatMsg = { id: uid('m'), seat, author: 'human', text }
+          setChat((c) => [...c.slice(-199), m])
+          net?.broadcast({ t: 'chat', msg: m })
+          break
+        }
+        case 'mark': {
+          const seat = peerSeats.current.get(from)
+          if (seat == null || !rules.targetsPublic || !msg.mark) return
+          const mark = { ...(msg.mark as TargetMark), seat }
+          setForeignMarks((ms) => [...ms.filter((x) => x.id !== mark.id), mark])
+          net?.broadcast({ t: 'mark', mark })
+          break
+        }
+        case 'mark-del': {
+          const seat = peerSeats.current.get(from)
+          if (seat == null) return
+          setForeignMarks((ms) => {
+            const hit = ms.find((x) => x.id === msg.id)
+            if (hit && hit.seat !== seat) return ms
+            return ms.filter((x) => x.id !== msg.id)
+          })
+          net?.broadcast({ t: 'mark-del', id: msg.id })
+          break
+        }
+      }
+    },
+    [meId, rules.targetsPublic, rosterList, pushRoster, commitRemote, liveRef],
+  )
+
+  /** peer：host 广播处理 */
+  const peerEvent = useCallback(
+    (msg: RoomMsg) => {
+      switch (msg.t) {
+        case 'seat-assign':
+          netSeatRef.current = msg.seat as number
+          setNetSeat(msg.seat as number)
+          break
+        case 'roster':
+          applyRoster(msg.seats as Parameters<typeof applyRoster>[0])
+          break
+        case 'snapshot': {
+          const m = msg as {
+            seats?: Parameters<typeof applyRoster>[0]
+            ops?: Op[]
+            foreignMarks?: TargetMark[]
+            round?: number
+            drawerSeat?: number
+            hintLen?: number
+            roundOver?: boolean
+            answer?: string
+            endsAt?: number
+          }
+          if (Array.isArray(m.seats)) applyRoster(m.seats)
+          if (Array.isArray(m.ops)) setOps(m.ops)
+          if (Array.isArray(m.foreignMarks)) setForeignMarks(m.foreignMarks)
+          if (typeof m.round === 'number') setRound(m.round)
+          if (typeof m.drawerSeat === 'number') setDrawerNow(m.drawerSeat)
+          setNetHintLen(m.hintLen ?? 0)
+          endsAtRef.current = m.endsAt ?? 0
+          if (m.roundOver) {
+            setRoundOver(true)
+            if (m.answer) setRoundTarget((t) => ({ ...t, word: m.answer! }))
+          }
+          if (m.endsAt && !m.roundOver) setTimeLeft(Math.max(0, Math.round((m.endsAt - Date.now()) / 1000)))
+          break
+        }
+        case 'word-offer':
+          setWordOptions((msg.options as WordOption[]) ?? [])
+          break
+        case 'round-start': {
+          const m = msg as unknown as { round: number; drawerSeat: number }
+          setRound(m.round)
+          setDrawerNow(m.drawerSeat)
+          setOps([])
+          setGhost(null)
+          setMarks([])
+          setForeignMarks([])
+          setWord(null)
+          setWordOptions([])
+          setGuessed(false)
+          setGuessedSeats([])
+          guessedRef.current.clear()
+          setWhisper(null)
+          whisperReq.current = false
+          whisperUsed.current = false
+          redoStack.current = []
+          busy.current = false
+          setRoundTarget({ ...GUESSER_TARGET, word: '' })
+          setNetHintLen(0)
+          endsAtRef.current = 0
+          setRoundOver(false)
+          setTimeLeft(rules.roundTime)
+          say({ seat: null, author: 'system', text: `第 ${m.round} 轮开始` })
+          break
+        }
+        case 'round-live': {
+          const m = msg as { hintLen?: number; endsAt?: number }
+          setNetHintLen(m.hintLen ?? 0)
+          endsAtRef.current = m.endsAt ?? 0
+          if (m.endsAt) setTimeLeft(Math.max(0, Math.round((m.endsAt - Date.now()) / 1000)))
+          break
+        }
+        case 'round-over': {
+          const m = msg as { answer?: string; scores?: [number, number][] }
+          if (m.answer) setRoundTarget((t) => ({ ...t, word: m.answer! }))
+          if (Array.isArray(m.scores)) patchScores(m.scores)
+          setRoundOver(true)
+          break
+        }
+        case 'session-over': {
+          const r = (msg as { result?: SessionResult }).result
+          if (r) setNetResult(r)
+          break
+        }
+        case 'tick':
+          if (typeof msg.left === 'number') setTimeLeft(msg.left)
+          break
+        case 'scores':
+          if (Array.isArray(msg.map)) patchScores(msg.map as [number, number][])
+          break
+        case 'guess-result': {
+          const m = msg as { seat?: number; verdict?: string }
+          if (m.seat != null && m.verdict === 'correct') {
+            guessedRef.current.add(m.seat)
+            setGuessedSeats([...guessedRef.current])
+            if (m.seat === netSeatRef.current) setGuessed(true)
+          }
+          break
+        }
+        case 'ops': {
+          const ops = msg.ops as Op[] | undefined
+          if (!Array.isArray(ops)) return
+          setOps((prev) => {
+            const ids = new Set(prev.map((o) => o.id))
+            return [...prev, ...ops.filter((o) => !ids.has(o.id))]
+          })
+          liveRef.current?.notifyOps(ops)
+          break
+        }
+        case 'op-del': {
+          const ids = new Set((msg.ids as string[]) ?? [])
+          setOps((p) => p.filter((o) => !ids.has(o.id)))
+          liveRef.current?.notifyOpsRemoved([...ids])
+          break
+        }
+        case 'chat': {
+          const m = msg.msg as ChatMsg | undefined
+          if (m?.text) setChat((c) => (c.some((x) => x.id === m.id) ? c : [...c.slice(-199), m]))
+          break
+        }
+        case 'mark': {
+          const mark = msg.mark as TargetMark | undefined
+          if (!mark || mark.seat === netSeatRef.current) return
+          setForeignMarks((ms) => [...ms.filter((x) => x.id !== mark.id), mark])
+          break
+        }
+        case 'mark-del':
+          setForeignMarks((ms) => ms.filter((x) => x.id !== msg.id))
+          break
+      }
+    },
+    [applyRoster, liveRef],
+  )
+
+  const onNetMembers = useCallback(
+    (members: string[]) => {
+      setNetView((v) => (v ? { ...v, peers: members.length } : v))
+      const net = netRef.current
+      if (net?.role !== 'host') return
+      const gone = [...peerSeats.current.keys()].filter((p) => !members.includes(p))
+      if (!gone.length) return
+      const goneSeats = new Set(gone.map((p) => peerSeats.current.get(p)!))
+      for (const p of gone) {
+        peerSeats.current.delete(p)
+        peerNames.current.delete(p)
+      }
+      setForeignMarks((ms) => ms.filter((m) => !goneSeats.has(m.seat)))
+      pushRoster()
+    },
+    [pushRoster],
+  )
+
+  // 分派走 ref：connect effect 只在 mount 跑一次，但要永远调用最新版 handler（避免陈旧闭包）
+  const dispatchRef = useRef<{ packet: (f: string, m: RoomMsg) => void; members: (m: string[]) => void }>({
+    packet: () => {},
+    members: () => {},
+  })
+  dispatchRef.current = {
+    packet: (from, msg) => {
+      const net = netRef.current
+      if (!net) return
+      if (net.role === 'host') hostIntent(from, msg)
+      else peerEvent(msg)
+    },
+    members: onNetMembers,
+  }
+
+  useEffect(() => {
+    if (!netParams || mode === 'relay') return
+    let dead = false
+    connectNet(netParams, {
+      onPacket: (f, m) => {
+        if (!dead) dispatchRef.current.packet(f, m)
+      },
+      onMembers: (m) => {
+        if (!dead) dispatchRef.current.members(m)
+      },
+      onClose: () => {
+        if (dead) return
+        netRef.current = null
+        setNetView(undefined)
+        showToast('联机已断开，回到单机')
+      },
+    })
+      .then((l) => {
+        if (dead) {
+          l.close()
+          return
+        }
+        netRef.current = l
+        setNetView({ role: l.role, room: l.room, peers: l.members().length })
+        if (l.role === 'host') pushRoster()
+        say({ seat: null, author: 'system', text: `联机房间 #${l.room} 已${l.role === 'host' ? '创建' : '加入'}（${l.transport}）` })
+      })
+      .catch(() => {
+        if (!dead) showToast('联机桥未响应，已回退单机')
+      })
+    return () => {
+      dead = true
+      netRef.current?.close()
+      netRef.current = null
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------- 你画我猜 ----------
   const pickWord = useCallback((w: WordOption) => {
     if (mode !== 'guess' || readOnly || S.current.word) return
+    const net = netRef.current
     setWord(w)
     usedWords.current.add(w.word)
+    if (net?.role === 'peer') {
+      net.intent({ t: 'pick-word', word: w.word })
+      say({ seat: null, author: 'system', text: `你选了「${w.word}」（只有你能看到）` })
+      return
+    }
+    setRoundTarget(w)
     say({ seat: null, author: 'system', text: `你选了「${w.word}」（只有你能看到），计时 ${rules.roundTime} 秒开始！` })
+    if (net?.role === 'host') {
+      const endsAt = Date.now() + rules.roundTime * 1000
+      endsAtRef.current = endsAt
+      net.broadcast({ t: 'round-live', hintLen: w.word.length, endsAt })
+    }
   }, [mode, readOnly, rules.roundTime, say])
 
   const whisperUsed = useRef(false)
@@ -579,6 +1184,12 @@ export function useGame(opts: UseGameOptions): GameState {
     const t = text.trim()
     if (!t) return
     const L = S.current
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      // 已猜中/本轮已结束 → 走普通聊天通道（host 的 chat 意图处理与猜词无关）
+      net.intent({ t: L.guessed || L.roundOver ? 'chat' : 'guess', text: t })
+      return
+    }
     if (!readOnly || L.guessed || L.roundOver) return say({ seat: meId, author: 'human', text: t })
     const r = judgeGuess(t, L.roundTarget)
     if (r === 'correct') {
@@ -588,15 +1199,17 @@ export function useGame(opts: UseGameOptions): GameState {
       score(meId, pts)
       score(drawerSeat.current, 40)
       say({ seat: meId, author: 'system', text: `你猜中了！+${pts}${whisperUsed.current ? '（提示 ×0.5）' : ''}`, kind: 'correct' })
+      pushScores([[meId, pts], [drawerSeat.current, 40]])
       markGuessed(meId)
     } else if (r === 'close') say({ seat: meId, author: 'system', text: `「${t}」很接近了`, kind: 'close' })
     else say({ seat: meId, author: 'human', text: t })
-  }, [readOnly, meId, rules.roundTime, say, score, markGuessed])
+  }, [readOnly, meId, mySeat, rules.roundTime, say, score, markGuessed, pushScores])
 
   const whisperReq = useRef(false)
   const askWhisper = useCallback(() => {
     if (rules.guesserAgent !== 'whisper') return showToast('本房间未开启 Agent 悄悄提示')
     if (!readOnly) return showToast('只有猜词者可以请求提示')
+    if (netRef.current) return showToast('联机模式下悄悄提示暂不可用')
     const self = S.current.seats.find((s) => s.id === meId)
     if (!self?.agent) return showToast('你还没有接入 Agent')
     if (S.current.guessed || S.current.roundOver || whisperReq.current) return
@@ -611,13 +1224,41 @@ export function useGame(opts: UseGameOptions): GameState {
     })
   }, [rules.guesserAgent, readOnly, meId, showToast, patchAgent, log, later])
 
-  // ---------- 图文传话 ----------
+  // ---------- 图文传话（多题同派） ----------
   const submitRelay = useCallback(() => {
-    if (mode !== 'relay' || S.current.submitted) return
-    setSubmitted(true)
+    if (mode !== 'relay' || !relayTurn || S.current.submitted) return
+    const turn = relayTurn
+    const turnOps = S.current.ops.slice()
+    const nextQueue: RelayTurn[] = []
+    setRelayChains((chains) =>
+      chains.map((chain) => {
+        if (chain.id !== turn.chainId) return chain
+        const nextSteps = chain.steps.map((s, i) => (i === turn.stepIdx ? { ...s, ops: turnOps, done: true } : s))
+        const nxt = nextSteps[turn.stepIdx + 1]
+        if (nxt && nxt.seat === meId) nextQueue.push({ chainId: chain.id, stepIdx: nxt.step, prompt: nxt.prompt })
+        return { ...chain, steps: nextSteps }
+      }),
+    )
+    const updated = relayQueue.filter((t) => !(t.chainId === turn.chainId && t.stepIdx === turn.stepIdx))
+    const rest = [...updated, ...nextQueue]
+    setRelayQueue(rest)
+    const next = rest[0] ?? null
+    setRelayTurn(next)
+    setSubmitted(!next)
+    setOps([])
+    setGhost(null)
     clearMarks()
-    say({ seat: null, author: 'system', text: '你的画作已提交，等待其他玩家…' })
-  }, [mode, say, clearMarks])
+    redoStack.current = []
+    if (next) {
+      setTimeLeft(rules.roundTime)
+      say({ seat: null, author: 'system', text: `第 ${turn.stepIdx + 1} 棒已提交；下一题「${next.prompt}」` })
+    } else if (relayChains.every((c) => c.steps.every((s) => s.done))) {
+      setRoundOver(true)
+      say({ seat: null, author: 'system', text: '所有传画链已完成，前往相册揭晓' })
+    } else {
+      say({ seat: null, author: 'system', text: `第 ${turn.stepIdx + 1} 棒已提交，等新题目派发…` })
+    }
+  }, [mode, meId, relayTurn, relayQueue, relayChains, rules.roundTime, say, clearMarks])
 
   // ---------- 聊天 ----------
   const sendChat = useCallback((text: string) => {
@@ -627,7 +1268,14 @@ export function useGame(opts: UseGameOptions): GameState {
       if (!readOnly && !S.current.roundOver) return showToast('画手不能在聊天里发言')
       if (readOnly) return submitGuess(t)
     }
-    say({ seat: meId, author: 'human', text: t })
+    const net = netRef.current
+    if (net?.role === 'peer') {
+      net.intent({ t: 'chat', text: t })
+      return
+    }
+    const msg: ChatMsg = { id: uid('m'), seat: meId, author: 'human', text: t }
+    setChat((c) => [...c.slice(-199), msg])
+    net?.broadcast({ t: 'chat', msg })
   }, [mode, readOnly, meId, showToast, submitGuess, say])
 
   // ---------- 回放 ----------
@@ -674,7 +1322,7 @@ export function useGame(opts: UseGameOptions): GameState {
       getRound: () => S.current.round,
       drawerSeat: () => drawerSeat.current,
       setDrawerSeat: (id) => {
-        drawerSeat.current = id
+        setDrawerNow(id)
       },
       isOver: () => S.current.roundOver,
       showMark: (m) => {
@@ -683,7 +1331,8 @@ export function useGame(opts: UseGameOptions): GameState {
       hideMark: (id) => setForeignMarks((fm) => fm.filter((x) => x.id !== id)),
     }
     simCtxRef.current = ctx
-    startSimulation(ctx)
+    // 联机模式下关掉本地剧本：真实对端就是玩家，各端各跑模拟会分裂画面（bot 填充等 P4）
+    if (!netParams) startSimulation(ctx)
     if (resumeData?.ops?.length) later(800, () => showToast('已恢复上次未完成的画布'))
 
     // 真实 Agent 桥（teadraw mcp）：连上就把"我的 Agent"交给真实 MCP 工具处理；连不上走本地模拟
@@ -695,6 +1344,7 @@ export function useGame(opts: UseGameOptions): GameState {
       markUsed: (ids) => setMarks((ms) => ms.map((m) => (ids.includes(m.id) ? { ...m, used: true } : m))),
       clearMarks, showToast, commitOps, acceptGhost, getPen,
       drawerSeat: () => drawerSeat.current,
+      get relayTitle() { return S.current.relayTurn?.prompt ?? '' },
     }
     liveRef.current = attachLiveAgent(liveCtx, setLive)
 
@@ -702,11 +1352,21 @@ export function useGame(opts: UseGameOptions): GameState {
       every(1000, () => {
         const L = S.current
         if (L.timeLeft == null || L.timeLeft <= 0 || L.roundOver) return
-        if (mode === 'guess' && !readOnly && !L.word) return
+        const net = netRef.current
+        if (mode === 'guess') {
+          // 选词阶段不走表：单机画手未选词 / host 等本轮词落定（自己选了 or 收到 pick-word）/ peer 等 round-live
+          if (!net) {
+            if (!readOnly && !L.word) return
+          } else if (net.role === 'peer') {
+            if (!endsAtRef.current) return
+          } else if (!(drawerSeat.current === meId ? L.word : L.roundTarget.word)) return
+        }
         const next = L.timeLeft - 1
         S.current.timeLeft = next
         setTimeLeft(next)
+        if (net?.role === 'host' && next % 5 === 0) net.broadcast({ t: 'tick', left: next })
         if (next > 0) return
+        if (net?.role === 'peer') return // 结束判定归 host，等 round-over 广播
         if (mode === 'guess') endRound()
         else if (!L.submitted) {
           submitRelay()
@@ -715,11 +1375,38 @@ export function useGame(opts: UseGameOptions): GameState {
       })
     }
     if (mode === 'relay') {
-      const step = () => {
-        setOthersDone((d) => Math.min(5, d + 1))
-        later(4000 + Math.random() * 3000, step)
+      // 后台模拟：每 2.5-4.5 秒随机完成一条链的下一棒；若下一棒是本地座位，就加进队列
+      const sim = () => {
+        const L = S.current
+        if (L.roundOver) return
+        const candidates = L.relayChains.filter((c) => c.steps.some((s) => !s.done && s.seat !== meId))
+        if (!candidates.length) return
+        const chain = candidates[Math.floor(Math.random() * candidates.length)]
+        const idx = chain.steps.findIndex((s) => !s.done && s.seat !== meId)
+        if (idx === -1) return
+        const nxt = chain.steps[idx + 1]
+        const enqueued: RelayTurn | null = nxt && nxt.seat === meId ? { chainId: chain.id, stepIdx: nxt.step, prompt: nxt.prompt } : null
+        setRelayChains((chains) =>
+          chains.map((c) => {
+            if (c.id !== chain.id) return c
+            const steps = c.steps.map((s, i) => (i === idx ? { ...s, ops: [] as Op[], done: true } : s))
+            return { ...c, steps }
+          }),
+        )
+        if (enqueued) {
+          setRelayQueue((q) => {
+            const queue = [...q, enqueued!]
+            if (!L.relayTurn) {
+              setRelayTurn(queue[0])
+              setSubmitted(false)
+              setTimeLeft(rules.roundTime)
+              say({ seat: null, author: 'system', text: `新题目已派发 · 「${queue[0].prompt}」` })
+            }
+            return queue
+          })
+        }
       }
-      later(4000 + Math.random() * 3000, step)
+      every(2500 + Math.random() * 2000, sim)
     }
 
     const ts = timers.current
@@ -829,21 +1516,27 @@ export function useGame(opts: UseGameOptions): GameState {
 
   const hint = useMemo(() => {
     if (!readOnly) return word ? word.word.split('') : []
+    if (netParams) {
+      // peer 猜词者：词本体不下发，按 hintLen 画空槽；round-over 后 roundTarget.word 已填回显答案
+      const chars = (roundTarget.word || '').split('')
+      if (roundOver && chars.length) return chars
+      return Array(netHintLen).fill('')
+    }
     const chars = roundTarget.word.split('')
     if (guessed || roundOver) return chars
     const half = timeLeft != null && timeLeft <= rules.roundTime / 2
     return chars.map((ch, i) => (half && i === chars.length - 1 ? ch : ''))
-  }, [readOnly, word, guessed, roundOver, timeLeft, rules.roundTime, roundTarget])
+  }, [readOnly, word, guessed, roundOver, timeLeft, rules.roundTime, roundTarget, netHintLen, netParams])
 
   return {
-    mode, rules, seats, me, role, readOnly, frame, live,
+    mode, rules, seats, me, role, readOnly, frame, live, net: netView, netResult,
     ops, ghost, marks, foreignMarks, guideMode, setGuideMode, gridOn, setGridOn, thinking, pens, penKeys,
     cam, setCam, tool, setTool, color, setColor, width, setWidth, spaceDown,
     chat, activity, toast, ink, focusNonce,
     highlightAgent, setHighlightAgent, hiddenSeats, toggleSeatVisible,
     timeLeft, word, wordOptions: mode === 'guess' && !readOnly ? wordOptions : [], pickWord, hint, guessed, whisper, roundOver, answer,
-    relayDone: othersDone + (submitted ? 1 : 0), submitted, guessedSeats,
-    round, roundsTotal, isLastRound, nextRound, collectResult,
+    relayDone, submitted, guessedSeats, relayTitle, relayChains, relayQueue, relayTurn,
+    round, roundsTotal, isLastRound, nextRound, collectResult, requestFinish,
     draw, erase, undo, redo, addMark, removeMark, clearMarks, askAgent, acceptGhost, rejectGhost, ghostTf, lastStamp,
     sendChat, submitGuess, askWhisper, submitRelay, replay, zoomBy, resetView,
   }

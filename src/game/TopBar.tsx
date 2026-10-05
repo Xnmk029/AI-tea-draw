@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ArrowRight, LogOut, Settings, Share2, Undo2 } from 'lucide-react'
 import { MODES } from '../core/theme'
-import { RELAY_PROMPT, RELAY_STEP, ROOM_CODE, TEA_THEME } from '../mock/room'
+import { ROOM_CODE, TEA_THEME } from '../mock/room'
 import { AvatarStack } from '../components/Avatar'
 import { Logo } from '../components/Logo'
 import type { GameState } from './gameTypes'
@@ -15,8 +15,13 @@ export function TopBar({ g, onExit, onFinish }: { g: GameState; onExit: () => vo
           <Logo size={24} />
         </button>
         <div className="tb-room">
-          <b>#{ROOM_CODE}</b>
+          <b>#{g.net ? g.net.room : ROOM_CODE}</b>
           <span className={`mode-badge m-${g.mode}`}>{MODES[g.mode].name}</span>
+          {g.net && (
+            <span className="mode-badge net-badge" title={`联机房间 ${g.net.room}`}>
+              {g.net.role === 'host' ? '主机' : '联机'} · {g.net.peers}人
+            </span>
+          )}
         </div>
         {menu && (
           <div className="menu island" onMouseLeave={() => setMenu(false)}>
@@ -72,25 +77,32 @@ function ModeHeader({ g }: { g: GameState }) {
       </div>
     )
 
-  if (g.mode === 'relay')
+  if (g.mode === 'relay') {
+    const turn = g.relayTurn
+    const chain = g.relayChains.find((c) => c.id === turn?.chainId)
+    const step = turn ? turn.stepIdx + 1 : 1
+    const total = chain ? chain.steps.length : 3
+    const relayTotal = g.relayChains.reduce((n, c) => n + c.steps.length, 0)
+    const left = g.relayQueue.length + (turn ? 1 : 0)
     return (
       <div className="mode-head island">
         <div className="mh-steps">
-          {Array.from({ length: RELAY_STEP.total }).map((_, i) => (
-            <i key={i} className={i < RELAY_STEP.current - 1 ? 'done' : i === RELAY_STEP.current - 1 ? 'cur' : ''} />
+          {Array.from({ length: total }).map((_, i) => (
+            <i key={i} className={i < step - 1 ? 'done' : i === step - 1 ? 'cur' : ''} />
           ))}
         </div>
         <span className="mh-label">
-          第 {RELAY_STEP.current}/{RELAY_STEP.total} 步 · 根据这句话作画
+          第 {step}/{total} 棒 · 待画 {left} 题 · 总进度 {g.relayDone}/{relayTotal}
         </span>
-        <b className="mh-prompt">「{RELAY_PROMPT}」</b>
+        <b className="mh-prompt">「{g.relayTitle}」</b>
         <span className="mh-sep" />
         <span className="mh-label">
-          已提交 {g.relayDone}/{RELAY_STEP.total}
+          已提交 {g.relayDone}/{relayTotal}
         </span>
-        <Timer left={g.timeLeft} total={total} />
+        <Timer left={g.timeLeft} total={g.rules.roundTime} />
       </div>
     )
+  }
 
   return (
     <div className="mode-head island">

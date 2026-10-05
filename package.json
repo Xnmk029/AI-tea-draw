@@ -10,9 +10,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "lazy-brush": "^2.0.2",
     "lucide-react": "^0.511.0",
+    "p5.brush": "^2.2.3",
+    "perfect-freehand": "^1.2.3",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/react": "^19.1.6",

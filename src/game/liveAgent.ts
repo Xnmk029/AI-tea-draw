@@ -5,7 +5,7 @@
 import type { AgentStatus, ChatMsg, GuessRole, ModeId, Op, RoomRules, Seat, SvgEl, Transform } from '../core/types'
 import { STAGE, type Pt, type Rect } from '../core/geometry'
 import { POLICY_PRESETS, sanitizeSvg } from '../core/svgPolicy'
-import { RELAY_PROMPT, RELAY_STEP, ROOM_CODE, TEA_THEME, judgeGuess, whisperFor } from '../mock/room'
+import { RELAY_STEP, ROOM_CODE, TEA_THEME, judgeGuess, whisperFor } from '../mock/room'
 import { MAX_MARKS, type Camera, type Ghost, type Pen, type WordOption } from './gameTypes'
 import { animateOps, buildBatch, elStart, uid, type Batch } from './engine'
 import {
@@ -60,6 +60,8 @@ export interface LiveCtx {
   getPen: (key: string) => Pen | undefined
   /** 本轮画手座位（猜词视角轮换） */
   drawerSeat: () => number
+  /** 本场传话题目（网文标题池抽取或房规指定） */
+  relayTitle: string
 }
 
 interface LiveEvent {
@@ -185,7 +187,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
           text: pendingTask.text,
           mode,
           theme: mode === 'tea' ? rules.theme || TEA_THEME : undefined,
-          prompt: mode === 'relay' ? RELAY_PROMPT : undefined,
+          prompt: mode === 'relay' ? ctx.relayTitle : undefined,
           step: mode === 'relay' ? RELAY_STEP : undefined,
           word: mode === 'guess' && role === 'drawer' ? L.word?.word : undefined,
           targets: ctx.state().marks.length,

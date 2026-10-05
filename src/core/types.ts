@@ -70,6 +70,8 @@ export interface RoomRules {
   avoidOthers?: boolean
   /** 本场主题（茶绘显示 + 喂给 Agent）；留空用默认主题 */
   theme?: string
+  /** 图文传话指定题目；留空开局从网文标题池随机抽 */
+  relayPrompt?: string
   /** 你画我猜的自定义词库（追加进抽词池，没有参考画，Agent 自由发挥） */
   wordBank?: string[]
 }

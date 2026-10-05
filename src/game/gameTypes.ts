@@ -4,6 +4,7 @@ import type { Pt, Rect } from '../core/geometry'
 import type { DrawingKey } from '../mock/drawings'
 import type { DrawTarget, TargetMark } from './targeting'
 import type { LivePeer } from './mcpClient'
+import type { NetParams } from './netSync'
 
 export type { DrawTarget, TargetMark } from './targeting'
 export type { LivePeer, LivePeerState } from './mcpClient'
@@ -77,9 +78,37 @@ export interface UseGameOptions {
   seats: Seat[]
   rules: RoomRules
   guessRole: GuessRole
+  /** 联机参数（?net=&token=&room=&name= 深链）；缺省 = 单机模拟 */
+  net?: NetParams
 }
 
 /** 一场对局的结算载荷：进结算屏时由 useGame 收集，App 透传给 ResultScreen */
+/** 图文传话真实链里的一棒 */
+export interface RelayStep {
+  step: number
+  seat: number
+  /** 这一棒要画的提示句 */
+  prompt: string
+  ops: Op[]
+  done: boolean
+}
+
+/** 一条完整的传画链 */
+export interface RelayChain {
+  id: string
+  starter: number
+  steps: RelayStep[]
+}
+
+/** 当前派发给我的待作画任务 */
+export interface RelayTurn {
+  chainId: string
+  stepIdx: number
+  prompt: string
+  /** 截止时间戳（ms）；undefined 不限时 */
+  dueAt?: number
+}
+
 export interface SessionResult {
   mode: ModeId
   /** 终局座位（真实得分/在线状态） */
@@ -94,6 +123,8 @@ export interface SessionResult {
   rounds: number
   /** 茶绘主题 / 传话题目 */
   theme?: string
+  /** 图文传话：真实链 */
+  relayChains?: RelayChain[]
   startedAt: number
   durationMs: number
 }
@@ -161,6 +192,14 @@ export interface GameState {
   answer: string
   /** 图文传话：已提交人数 / 我是否已提交 */
   relayDone: number
+  /** 本场传话题目（网文标题池抽取或房规指定） */
+  relayTitle: string
+  /** 本场全部真实传画链 */
+  relayChains: RelayChain[]
+  /** 我当前还没画的任务队列；做完一个立即派发下一个 */
+  relayQueue: RelayTurn[]
+  /** 我当前正在做的任务 */
+  relayTurn: RelayTurn | null
   submitted: boolean
   /** 你画我猜：本轮已猜中的座位 id（新增，可选） */
   guessedSeats?: number[]
@@ -176,6 +215,12 @@ export interface GameState {
 
   /** 真实 Agent 桥（teadraw mcp）的连接状态；off/connecting 时走本地模拟 */
   live?: LivePeer
+  /** 联机房间状态（netSync）；undefined = 单机 */
+  net?: { role: 'host' | 'peer'; room: string; peers: number }
+  /** peer 端收到 host 的 session-over 载荷（GameScreen 据此跳结算屏） */
+  netResult?: SessionResult | null
+  /** 结束整局：host 结算+广播并返回载荷；peer 发 end-req 返回 null（结算经 netResult 到达） */
+  requestFinish: () => SessionResult | null
 
   draw: (el: SvgEl) => void
   erase: (opId: string) => void

@@ -60,6 +60,79 @@
 | icons/ico-lasso.svg | lasso | Delapouite | https://game-icons.net/1x1/delapouite/lasso.html |
 | icons/ico-path.svg | trail | Delapouite | https://game-icons.net/1x1/delapouite/trail.html |
 | icons/ico-grid-3x3.svg | empty-chessboard | Delapouite | https://game-icons.net/1x1/delapouite/empty-chessboard.html |
+| icons/ico-check.svg | check-mark | Delapouite | https://game-icons.net/1x1/delapouite/check-mark.html |
+| icons/ico-send.svg | paper-plane | Delapouite | https://game-icons.net/1x1/delapouite/paper-plane.html |
+| icons/ico-rotate-ccw.svg | anticlockwise-rotation | Delapouite | https://game-icons.net/1x1/delapouite/anticlockwise-rotation.html |
+| icons/ico-film.svg | film-strip | Delapouite | https://game-icons.net/1x1/delapouite/film-strip.html |
+| icons/ico-crosshair.svg | crosshair | Badges | https://game-icons.net/1x1/badges/crosshair.html |
+| icons/ico-sound.svg | speaker | Delapouite | https://game-icons.net/1x1/delapouite/speaker.html |
+| icons/ico-sound-off.svg | mute | Delapouite | https://game-icons.net/1x1/delapouite/mute.html |
+| icons/ico-x.svg | cross-mark | Lorc | https://game-icons.net/1x1/lorc/cross-mark.html |
+| icons/ico-plus.svg | plus | Badges | https://game-icons.net/1x1/badges/plus.html |
+| icons/ico-copy.svg | files | Delapouite | https://game-icons.net/1x1/delapouite/files.html |
+| icons/ico-download.svg | save | Delapouite | https://game-icons.net/1x1/delapouite/save.html |
+| icons/ico-play.svg | play-button | Guard13007 | https://game-icons.net/1x1/guard13007/play-button.html |
+| icons/ico-pause.svg | pause-button | Guard13007 | https://game-icons.net/1x1/guard13007/pause-button.html |
+| icons/ico-user-plus.svg | convince | Delapouite | https://game-icons.net/1x1/delapouite/convince.html |
+| icons/ico-arrow-left.svg | return-arrow | Lorc | https://game-icons.net/1x1/lorc/return-arrow.html |
+| icons/ico-arrow-right.svg | next-button | Delapouite | https://game-icons.net/1x1/delapouite/next-button.html |
+| icons/ico-move.svg | move | Delapouite | https://game-icons.net/1x1/delapouite/move.html |
+| icons/ico-shield-check.svg | checked-shield | Lorc | https://game-icons.net/1x1/lorc/checked-shield.html |
+| icons/ico-heart.svg | hearts | Skoll | https://game-icons.net/1x1/skoll/hearts.html |
+| icons/ico-image.svg | mountains | Lorc | https://game-icons.net/1x1/lorc/mountains.html |
+| icons/ico-flask.svg | flask | Badges | https://game-icons.net/1x1/badges/flask.html |
+| icons/ico-square-dashed.svg | select | Sbed | https://game-icons.net/1x1/sbed/select.html |
+| icons/ico-spline.svg | curvy-knife | Lorc | https://game-icons.net/1x1/lorc/curvy-knife.html |
+| icons/ico-activity.svg | pulse | Sbed | https://game-icons.net/1x1/sbed/pulse.html |
+
+## lucide-react → 新图标对照表（供 T5 替换组件用）
+
+| lucide 图标 | 新文件 | 备注 |
+|---|---|---|
+| Pencil | ico-brush.svg | 画笔 |
+| Flag | ico-flag.svg | 指引笔/令旗 |
+| Slash | ico-line.svg | 直线 |
+| Square / SquareDashed | ico-square.svg / ico-square-dashed.svg | 矩形/虚线框 |
+| Circle | ico-circle.svg | 椭圆/圆 |
+| Eraser | ico-eraser.svg | 橡皮（broom 造型）|
+| Hand / Move | ico-hand.svg / ico-move.svg | 抓手/平移 |
+| Undo2 / History | ico-undo.svg | 撤销 |
+| Redo2 | ico-redo.svg | 重做 |
+| Plus / Minus（缩放） | ico-zoom-in.svg / ico-zoom-out.svg | — |
+| Plus / Minus（数值调节） | ico-plus.svg / ico-zoom-out.svg | 大厅房规加减 |
+| RotateCcw | ico-rotate-ccw.svg | 重播/重置 |
+| Play / Pause | ico-play.svg / ico-pause.svg | 回放 |
+| Maximize | ico-fullscreen.svg | 全屏 |
+| Share2 | ico-share.svg | 分享 |
+| LogOut | ico-exit-door.svg | 离开 |
+| Settings | ico-gear.svg | 设置 |
+| Users / UserPlus | ico-people.svg / ico-user-plus.svg | 成员/邀请 |
+| MessageCircle | ico-chat-scroll.svg | 聊天 |
+| Layers | ico-layers.svg | 图层 |
+| Eye / EyeOff | ico-eye.svg / ico-eye-off.svg | 显隐 |
+| Lock / Unlock | ico-lock.svg（Unlock 暂无，可补 game-icons 'padlock-open'）| 锁 |
+| Crown | ico-crown.svg | 房主/冠军 |
+| Check | ico-check.svg | 确认 |
+| X | ico-x.svg | 关闭 |
+| ArrowLeft / ArrowRight | ico-arrow-left.svg / ico-arrow-right.svg | — |
+| Copy | ico-copy.svg | 复制房间码 |
+| Download | ico-download.svg | 导出 |
+| Send | ico-send.svg | 发送 |
+| Trophy | ico-trophy.svg | 排行 |
+| Film | ico-film.svg | 回放 |
+| Heart | ico-heart.svg | 最离谱票 |
+| ImageIcon | ico-image.svg | 画作 |
+| Stamp | ico-stamp-seal.svg | 盖章 |
+| ShieldCheck | ico-shield-check.svg | 校验 |
+| Grid3X3 | ico-grid-3x3.svg | 九宫格 |
+| Lasso | ico-lasso.svg | 套索 |
+| Spline | ico-spline.svg | 引导路径（curvy-knife）|
+| Crosshair | ico-crosshair.svg | 落点 |
+| Activity | ico-activity.svg | MCP 活动流 |
+| Terminal | ico-activity.svg 或自绘 | Agent CLI |
+| FlaskConical | ico-flask.svg | DEMO |
+| Sparkles | ico-sparkle.svg | 高亮 |
+| ArrowUp | ico-arrow-right.svg 旋转 -90° | 发送指令 |
 
 游戏内署名文案（放进制作人员名单 / About 页时可直接用）：
 

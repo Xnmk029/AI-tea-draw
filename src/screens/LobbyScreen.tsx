@@ -4,6 +4,7 @@ import type { AgentLevel, GuesserAgent, ModeId, PresetId, RoomRules, Seat } from
 import { AGENT_LEVELS, GUESSER_AGENT, MODES } from '../core/theme'
 import { ALLOWED_TAGS, BLOCKED_TAGS, POLICY_PRESETS } from '../core/svgPolicy'
 import { DEFAULT_RULES, MAX_SEATS, ROOM_CODE, TEA_THEME } from '../mock/room'
+import { rollRelayTitle } from '../mock/prompts'
 import type { SceneItem } from '../mock/drawings'
 import { Avatar } from '../components/Avatar'
 import { AgentGlyph } from '../components/AgentGlyph'
@@ -274,6 +275,25 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
                         </button>
                       </div>
                     </div>
+                  </div>
+                )}
+                {mode === 'relay' && (
+                  <div className="rule">
+                    <div className="rule-label">本场题目</div>
+                    <div className="relay-title-card">
+                      <b>{rules.relayPrompt || '开局随机抽一条网文标题'}</b>
+                      <div className="relay-title-btns">
+                        <button className="btn btn-sm" onClick={() => set('relayPrompt', rollRelayTitle())}>
+                          换一个
+                        </button>
+                        {rules.relayPrompt && (
+                          <button className="btn btn-sm" onClick={() => set('relayPrompt', undefined)}>
+                            随机
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <p className="rule-hint">网文标题生成器：世界 × 职业 × 金手指 × 营生，如「我在大唐送外卖」</p>
                   </div>
                 )}
                 {mode === 'guess' && (

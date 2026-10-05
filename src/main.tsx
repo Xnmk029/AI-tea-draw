@@ -4,5 +4,6 @@ import './styles/app.css'
 import './ui/ui.css'
 import './ui/fonts.css'
 import './ui/assets.css'
+import './ui/brush.css'
 
 createRoot(document.getElementById('root')!).render(<App />)

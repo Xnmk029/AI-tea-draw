@@ -2,7 +2,7 @@ import type { RoomRules, Seat } from '../core/types'
 import type { Rect } from '../core/geometry'
 import { SEAT_COLORS } from '../core/theme'
 import type { WordOption } from '../game/gameTypes'
-import { matchDrawing, type DrawingKey, type SceneItem } from './drawings'
+import type { DrawingKey, SceneItem } from './drawings'
 
 export const ROOM_CODE = 'A7K2'
 export const MAX_SEATS = 8
@@ -52,15 +52,6 @@ export const GUESS_WORDS: WordOption[] = [
 /** 我是猜词者时第 1 轮的题目（后续轮从词池随机抽），画手轮换 */
 export const GUESSER_TARGET: WordOption = GUESS_WORDS[3]
 export const GUESS_DRAWER_SEAT = 2
-
-/** 词池 = 内置词 + 房规自定义词（自定义词没有参考画，交给 matchDrawing 匹配，匹配不上就随机画风自由发挥） */
-export function wordPool(rules: RoomRules): WordOption[] {
-  const custom = (rules.wordBank ?? [])
-    .map((w) => w.trim())
-    .filter(Boolean)
-    .map((w): WordOption => ({ word: w, drawing: matchDrawing(w), level: '自定义', close: [] }))
-  return [...GUESS_WORDS, ...custom]
-}
 
 /** 抽 n 个不重复的选项（画手选词卡）；exclude 掉本场已用过的词 */
 export function pickOptions(pool: WordOption[], n = 3, exclude: string[] = []): WordOption[] {

@@ -36,10 +36,10 @@
   pointer-events: none;
 }
 
-/* ---------- 左侧笔架：木纹 + 明暗渐变 ---------- */
+/* ---------- 左侧笔架：木纹压暗成深色木座，保住浅色图标的对比 ---------- */
 .brush-rack {
   background:
-    linear-gradient(165deg, rgba(255, 236, 200, 0.1), rgba(0, 0, 0, 0.28)),
+    linear-gradient(165deg, rgba(112, 82, 56, 0.62), rgba(28, 18, 11, 0.86)),
     var(--tex-wood-frame);
   background-size: auto, 384px;
 }

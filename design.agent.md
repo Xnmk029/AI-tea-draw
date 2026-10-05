@@ -192,11 +192,21 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 - **验收已过**：`node server/test-agent.mjs` + 无头浏览器完成「连接→领任务→找空位→描红→盖章→落定」，非法 SVG 会被剥离并写活动流。
 - 已知边界：K8 单页面、无鉴权（本地桥）、快照栅格化只在浏览器侧实现。
 
-### T2 笔触渲染器
-- 纯显示层：数据仍然是 SVG Op，只改渲染方式。
-- 实现笔压曲线（起笔重、收笔虚）、按种子固定的轻微抖动（种子取自 `op.id`，保证联机时各端画面一致）、干笔飞白遮罩、填充改为晕染色块。已落定的 op 缓存为位图图层，正在画的那一笔实时渲染。
-- 人和 Agent 的笔迹走同一个渲染器。
-- **验收**：同一份 SVG 渲染前后对比，几何形状不变，但呈现手绘质感；对局中有 200 个 op 时仍保持 60fps。
+### T2 笔触渲染器（已做 v1，剩余位图缓存 + 风格房规）
+- 纯显示层：数据仍然是 SVG Op，只改渲染方式——全部走 `renderEl`（`src/components/renderEl.tsx`），凡是"有可见描边且非虚线"的元素自动笔墨化：
+  - `src/brush/stroke.ts`：中心线重采样（detached SVG 几何引擎，~1.8px 步长）→ 压力曲线（`envAt` 起收笔包络 + `snoise` 种子抖动；`data-pp` 属性承载人手真实笔压）→ `perfect-freehand.getStroke` 变宽轮廓 → SVG 填充路径（`path.bs`）
+  - 运笔动画：`<mask>` 里放白色中线描边，沿用 `.draw` 的 dashoffset 揭幕；`data-op` 命中线另做透明克隆（elementFromPoint / pointOf 不受影响）
+  - `src/game/InkWash.tsx`：画布下垫 `p5.brush/standalone` 洇散层，每笔落定后 `polygon(out.pts)` 水彩晕染；`seed(hash(op.id))` 逐笔播种；相机移动用 CSS transform 假跟随、240ms 防抖重染
+  - 人手输入：lazy-brush 牵绳平滑 + `e.pressure` 存入 `data-pp`（SVG attrs 带前缀属性，经校验器自然剥离，不影响 Agent 契约）
+- 人和 Agent 的笔迹走同一个渲染器 ✓；结算回放、首页画作、幽灵预览自动生效（共用 renderEl）
+- **剩余**：笔墨风格房规（工笔/写意，引擎接口已留）、`.myb` 笔刷生态（reserve：reearth/hokusai Rust/WASM，libmypaint 兼容）
+- **性能（v2 已落地）**：
+  - 糙边不用 SVG 滤镜（`feTurbulence` 逐像素太重），改为轮廓顶点种子抖动写进几何——SVG 与位图两套渲染同一份数据
+  - `src/game/InkBake.tsx`：落定 op 烘焙进 Canvas2D 位图（人/Agent 两块，供 A 键高亮滤镜），SVG 只留透明命中线（`renderEl` 的 `hitOnly`）→ DOM 不随对局膨胀
+  - `sampleCenterline` 快路径：`M..Q..L` path 与 `points` 属性直接解析，免 DOM `getPointAtLength`
+  - `OpNode` memo：draft 拖动不再整树重渲全部笔迹
+  - InkWash/InkBake 平移缩放都用 CSS transform 假跟随 + 240ms 防抖重烘焙，避免每帧重算水彩/位图
+- **验收已过**：手画线与 Agent 素材同渲染、mask 揭幕逐笔、洇散底衬可见；tsc/build 通过，笔迹层独立 chunk（78KB 按需加载）
 
 ### T3 联网（Host 权威）
 - Op 广播格式：`{ op:'add'|'remove', id, seat, author, layer, el, tf, ink, t }`。由 Host 统一排序、校验、扣墨量，然后广播。

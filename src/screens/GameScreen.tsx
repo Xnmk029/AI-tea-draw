@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { Eye } from 'lucide-react'
 import type { GuessRole, ModeId, RoomRules, Seat } from '../core/types'
 import type { SessionResult } from '../game/gameTypes'
@@ -30,9 +30,31 @@ interface Props {
  *   舞台级   modal（选词、等待、回合结束） / toast
  */
 export function GameScreen({ mode, seats, rules, guessRole, onExit, onFinish }: Props) {
-  const g = useGame({ mode, seats, rules, guessRole })
+  // 联机深链：?net=<bridge端口>&token=<token>[&room=<房间码>][&name=<名字>]
+  const net = useMemo(() => {
+    const q = new URLSearchParams(location.search)
+    const port = q.get('net')
+    const token = q.get('token')
+    if (!port || !token) return undefined
+    return {
+      port: Number(port),
+      token,
+      room: q.get('room') ?? undefined,
+      name: q.get('name') ?? seats.find((s) => s.isMe)?.name,
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  const g = useGame({ mode, seats, rules, guessRole, net })
   const [sideOpen, setSideOpen] = useState(true)
-  const finish = () => onFinish(g.collectResult())
+  const finish = () => {
+    const r = g.requestFinish()
+    if (r) onFinish(r)
+    // peer 返回 null：等 host 的 session-over 广播 → 下方 netResult 效应兜底
+  }
+  useEffect(() => {
+    if (g.netResult) onFinish(g.netResult)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [g.netResult])
 
   return (
     <div className={`scr scr-game game mode-${mode} ${sideOpen ? 'side-on' : ''}`} style={{ '--side-w': sideOpen ? '344px' : '0px' } as CSSProperties}>

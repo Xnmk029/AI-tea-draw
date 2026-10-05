@@ -1,5 +1,4 @@
 import { ArrowRight, Check, Trophy } from 'lucide-react'
-import { RELAY_STEP } from '../mock/room'
 import { Avatar } from '../components/Avatar'
 import { AgentGlyph } from '../components/AgentGlyph'
 import { SceneThumb } from '../components/SceneThumb'
@@ -30,29 +29,34 @@ export function WordPicker({ g }: { g: GameState }) {
 }
 
 export function RelayWaiting({ g, onFinish }: { g: GameState; onFinish: () => void }) {
-  const others = g.seats.filter((s) => !s.isMe)
+  const left = g.relayQueue.length
+  const allDone = g.relayChains.every((c) => c.steps.every((s) => s.done))
   return (
     <div className="overlay soft">
       <div className="modal relay-wait">
         <div className="rw-check">
           <Check size={22} strokeWidth={3} />
         </div>
-        <h2>作品已提交</h2>
-        <p className="muted">等其他人画完，就进入第 {RELAY_STEP.current + 1} 步：根据别人的画写一句描述</p>
+        <h2>{allDone ? '全部完成' : left > 0 ? `还有 ${left} 题待画` : '等待新题目'}</h2>
+        <p className="muted">
+          {allDone
+            ? '本轮传画链全部完成，可以揭晓了'
+            : left > 0
+              ? '队列里还有派发给你的题目，继续画吧'
+              : '其他玩家正在接力，新题目马上到你'}
+        </p>
         <div className="rw-people">
-          {others.map((s, i) => {
-            const done = i < g.relayDone - 1
+          {g.relayChains.map((chain) => {
+            const done = chain.steps.filter((s) => s.done).length
             return (
-              <div key={s.id} className={`rw-p ${done ? 'done' : ''}`}>
-                <Avatar seat={s} size={36} badge={false} />
-                <span>{s.name}</span>
-                {done ? <Check size={12} strokeWidth={3} className="rw-ok" /> : <span className="rw-dots" />}
+              <div key={chain.id} className={`rw-p ${done === chain.steps.length ? 'done' : ''}`}>
+                <span>{done}/{chain.steps.length}</span>
               </div>
             )
           })}
         </div>
         <button className="btn btn-primary" onClick={onFinish}>
-          跳到相册揭晓（Demo） <ArrowRight size={15} />
+          {allDone ? '揭晓相册' : '先去看看'} <ArrowRight size={15} />
         </button>
       </div>
     </div>

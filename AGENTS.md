@@ -11,6 +11,7 @@ Vite + React 19 + TypeScript，前端 demo，其他玩家行为本地模拟；**
 - 截图/交互回归：`node tools/shot.mjs <steps.json> [outDir]`（无头 Chrome + CDP，步骤格式见脚本头部注释；dev server 需已启动；窗口尺寸用环境变量 `SHOT_SIZE=1920x1080`，此时舞台缩放为 1，步骤坐标即舞台坐标）
 - 真实 Agent 桥：`node server/teadraw.mjs mcp`（零依赖，MCP stdio + WS 桥 127.0.0.1:5190；`bridge` 只开桥、`ping` 测活；浏览器端用 `?mcp=<port>` 换端口）
 - Agent 端到端自测：`node server/test-agent.mjs`（需 dev server + 对局页已开；脚本化 MCP 客户端走全流程）
+- 联机（T3，协议与文件清单见 `design.net.md`）：`node server/teadraw-net.mjs hub`（本地中枢）→ `net --transport mock [--port 5191]`（每玩家一桥，打印 `?net=&token=` 深链）→ 浏览器开深链进 `?screen=game&mode=tea`；双端 e2e `node tools/net-e2e.mjs <tokA> <tokB>`
 
 ## Demo 深链
 `?screen=home|lobby|game|result&mode=tea|relay|guess&role=drawer|guesser`；`?resume=1` 恢复误刷新前的画布与比分；`?mcp=<port>` 换桥端口

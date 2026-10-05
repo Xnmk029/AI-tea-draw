@@ -4,7 +4,7 @@
 
 **A multiplayer drawing game where humans and AI Agents draw on the same canvas**
 
-人和 Agent 同桌作画的绘游 Demo —— 固定 1920×1080 茶桌舞台、六种「落笔指引」标记、茶宠 Agent、真实 MCP 桥接。
+人和 Agent 同桌作画的绘游 Demo —— 固定 1920×1080 茶桌舞台、六种「落笔指引」标记、茶宠 Agent、真实 MCP 桥接、笔墨渲染管线（压感笔迹 + 水墨洇散）。
 
 [![React](https://img.shields.io/badge/React-19-149eca?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
@@ -19,20 +19,16 @@
 
 <table>
   <tr>
-    <td><img src="docs/screenshots/v3-home.png" alt="主菜单"></td>
-    <td><img src="docs/screenshots/v3-lobby.png" alt="大厅 · 俯视茶桌"></td>
+    <td><img src="docs/screenshots/v4-home.png" alt="主菜单"></td>
+    <td><img src="docs/screenshots/v4-lobby.png" alt="大厅 · 俯视茶桌"></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/v3-game.png" alt="对局 · 茶绘"></td>
-    <td><img src="docs/screenshots/v2-marks-all.png" alt="落笔指引标记"></td>
+    <td><img src="docs/screenshots/v4-game.png" alt="对局 · 笔墨渲染"></td>
+    <td><img src="docs/screenshots/v4-anim.png" alt="运笔动画 · 沿中线揭幕"></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/v2-anchor-wheel.png" alt="锚定轮盘"></td>
-    <td><img src="docs/screenshots/live-3-committed.png" alt="真实 Agent 落笔"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshots/r2-roundover.png" alt="轮间结算"></td>
-    <td><img src="docs/screenshots/result-tea.png" alt="结算 · 真实回放"></td>
+    <td><img src="docs/screenshots/v4-brush.png" alt="手画笔迹 · 压感+洇散"></td>
+    <td><img src="docs/screenshots/v4-result.png" alt="结算 · 真实回放"></td>
   </tr>
 </table>
 
@@ -44,6 +40,7 @@
 
 ## 特性
 
+- **笔墨渲染**：SVG 数据不变，显示层笔墨化——`perfect-freehand` 压感轮廓（起承转合的笔压曲线，人画回放真实 `PointerEvent.pressure`；糙边用种子噪声写进几何，免滤镜）、`lazy-brush` 牵绳平滑、运笔时 `<mask>` 沿中线揭幕逐笔成画；落定笔迹自动烘焙进 `InkBake` 位图层（SVG 只留命中线，DOM 不随时长膨胀、平移缩放不再重排 40+ 滤镜路径），画布底下还有 `p5.brush`（standalone 版）水彩洇散底衬。同一份 Op 各端渲染一致（种子化，无 `Math.random`）
 - **落笔指引**：六种标记（令旗 / 区域 / 套索 / 引路 / 锚定 / 九宫格），手绘手势自动判定，或按 `1–6` 显式选择；茶宠按标记精确落笔
 - **吩咐 Agent**：`Ctrl+K` 唤起指令条，茶宠跑出「描红草稿」，`Tab` 盖章落定、`Esc` 揉掉、拖拽改位、角柄缩放
 - **真实 MCP 桥**：`server/teadraw.mjs` 零依赖 stdio MCP 服务 + WebSocket 桥，Claude Code / 自定义 Agent 通过 12 个工具直接接管你的茶宠；断开自动回退本地模拟
@@ -112,6 +109,7 @@ Agent ──stdio NDJSON──▶ teadraw.mjs ──WebSocket──▶ 浏览器
 ```
 server/teadraw.mjs     零依赖 MCP 桥：stdio NDJSON ↔ WebSocket，12 个工具路由
 server/test-agent.mjs  脚本化 MCP 客户端（端到端自测）
+src/brush/             笔墨渲染：采样→压力曲线→perfect-freehand 轮廓（确定性、可缓存）
 src/core/              领域类型、几何、主题令牌、SVG 白名单（Host 侧强制）
 src/game/              useGame（状态中枢）、engine（Op/笔速）、targeting（指引/占位）、
                        simulation（本地剧本）、liveAgent + mcpClient（真实链路）、对局组件
@@ -132,7 +130,9 @@ UI 动作与工具调用统一进 `useGame` → Op 追加到画布 → `liveAgen
 - [x] 你画我猜多轮局循环 + 轮换画手 + 轮间结算
 - [x] 结算屏真实数据（回放 / 墨量占比 / 贡献榜 / 导出）
 - [x] ErrorBoundary + `?resume=1` 画布恢复
-- [ ] 笔触渲染器（飞白/晕染，Op 位图落层防长局膨胀）
+- [x] 笔触渲染器（perfect-freehand 轮廓 + mask 运笔揭幕 + p5.brush 水彩洇散层；位图缓存落层待做）
+- [ ] 笔墨风格房规（工笔/写意/速写切换；引擎已留种子化接口）
+- [ ] `.myb` 笔刷生态预备方案：reearth/hokusai（Rust/WASM，libmypaint 兼容，跟踪中）
 - [ ] 音频系统（AudioManager + 三通道，素材清单见 [ASSETS.md](ASSETS.md)）
 - [ ] 多座联网（Steam P2P，Host 权威广播已预留）
 - [ ] Electron/Tauri 打包

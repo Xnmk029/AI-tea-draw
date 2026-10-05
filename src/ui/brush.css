@@ -1,0 +1,54 @@
+/* ============================================================
+   笔墨渲染配套样式（brush/stroke.ts + renderEl.tsx + InkWash/InkBake）
+   ============================================================ */
+
+/* 水墨洇散底衬层：垫在画布 SVG 之下（水彩洇晕） */
+.inkwash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.inkwash-canvas {
+  display: block;
+}
+
+/* 落定笔迹烘焙层：洇散之上、SVG 之下；人/Agent 两块分开供高亮特效 */
+.inkbake {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.inkbake-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+}
+
+/* A 键高亮 Agent 笔迹：烘焙位图跟随 .ops.hl 同款待遇 */
+.canvas-wrap.hl .inkbake-human {
+  opacity: 0.16;
+  filter: grayscale(1);
+}
+.canvas-wrap.hl .inkbake-agent {
+  filter: drop-shadow(0 0 5px rgba(79, 127, 98, 0.55));
+}
+.inkbake-canvas,
+.inkwash-canvas {
+  transition: opacity 0.25s;
+}
+
+/* 画布 svg 抬为定位元素，保证压在两层位图之上（同级按 DOM 序） */
+.canvas {
+  position: relative;
+}
+
+/* 全局 defs 容器自身不可见 */
+.svg-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
