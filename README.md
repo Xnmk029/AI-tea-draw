@@ -10,6 +10,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Vite](https://img.shields.io/badge/Vite-6-646cff?logo=vite&logoColor=white)](https://vite.dev)
 [![MCP](https://img.shields.io/badge/MCP-bridge-8b5cf6)](server/README.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 [![Zero deps](https://img.shields.io/badge/server%20runtime%20deps-0-brightgreen)](server/teadraw.mjs)
 
 </div>
@@ -146,4 +147,4 @@ UI 动作与工具调用统一进 `useGame` → Op 追加到画布 → `liveAgen
 
 ## License
 
-代码协议待声明；素材与字体授权逐条登记于 [CREDITS.md](CREDITS.md) / `licenses/`（素材实装中）。
+代码 [MIT](LICENSE)；素材与字体授权逐条登记于 [CREDITS.md](CREDITS.md) / `licenses/`。
