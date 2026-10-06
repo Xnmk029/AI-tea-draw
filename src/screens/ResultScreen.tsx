@@ -21,6 +21,8 @@ interface Props {
   result?: SessionResult | null
   onLobby: () => void
   onAgain: () => void
+  net?: boolean
+  canStart?: boolean
 }
 
 /** 真实笔迹渲染：把 Op[] 画进 svg（带 op.anim 时逐笔回放） */
@@ -63,13 +65,13 @@ const download = (name: string, url: string) => {
   a.click()
 }
 
-export function ResultScreen({ mode, onMode, seats, result, onLobby, onAgain }: Props) {
+export function ResultScreen({ mode, onMode, seats, result, onLobby, onAgain, net, canStart = true }: Props) {
   const seatList = result?.seats ?? seats
   const seatOf = (id: number) => seatList.find((s) => s.id === id) ?? seats.find((s) => s.id === id)!
   const ids = Object.keys(MODES) as ModeId[]
-  const shift = (d: number) => onMode(ids[(ids.indexOf(mode) + d + ids.length) % ids.length])
+  const shift = (d: number) => { if (!net) onMode(ids[(ids.indexOf(mode) + d + ids.length) % ids.length]) }
   useBack(onLobby)
-  useHotkeys({ Enter: onAgain, q: () => shift(-1), e: () => shift(1) })
+  useHotkeys({ Enter: () => { if (canStart) onAgain() }, q: () => shift(-1), e: () => shift(1) })
   return (
     <div className="scr scr-result">
       <div className="l-bg">
@@ -90,7 +92,7 @@ export function ResultScreen({ mode, onMode, seats, result, onLobby, onAgain }: 
           <span>本局结束</span>
           <h2>{MODES[mode].name}</h2>
         </div>
-        <div className="anchor a-tr mode-switch sm">
+        {!net && <div className="anchor a-tr mode-switch sm">
           <Key k="Q" />
           {ids.map((m) => (
             <button key={m} className={mode === m ? 'on' : ''} onClick={() => onMode(m)}>
@@ -98,10 +100,10 @@ export function ResultScreen({ mode, onMode, seats, result, onLobby, onAgain }: 
             </button>
           ))}
           <Key k="E" />
-        </div>
+        </div>}
         <div className="anchor a-br hud-row">
-          <button className="gbtn big primary" onClick={onAgain}>
-            <RotateCcw size={18} /> 再来一局 <Key k="Enter" />
+          <button className="gbtn big primary" onClick={onAgain} disabled={!canStart}>
+            <RotateCcw size={18} /> {canStart ? '再来一局' : '等待房主再开局'} <Key k="Enter" />
           </button>
         </div>
       </div>

@@ -30,6 +30,7 @@ export class NetClient {
   state: NetInfo | null = null
   private ws: WebSocket | null = null
   private connecting: Promise<this> | null = null
+  private closing: Promise<void> | null = null
   private seq = 0
   private pending = new Map<number, Pending>()
   private handlers = new Map<string, ((r: unknown) => void)[]>()
@@ -50,14 +51,18 @@ export class NetClient {
   connect(): Promise<this> {
     if (this.connecting) return this.connecting
     this.connecting = new Promise<this>((resolve, reject) => {
+      this.closing = null
       const ws = (this.ws = new WebSocket(`ws://127.0.0.1:${this.port}/bridge?token=${this.token}`))
       const timer = window.setTimeout(() => { ws.close(); reject(new Error('BRIDGE_CONNECT_TIMEOUT')) }, 10000)
-      ws.onopen = () => { window.clearTimeout(timer); resolve(this) }
+      ws.onopen = () => {}
       ws.onerror = () => { window.clearTimeout(timer); reject(new Error('BRIDGE_UNAVAILABLE')) }
       ws.onmessage = (ev) => {
-        const msg = JSON.parse(ev.data as string)
+        let msg
+        try { msg = JSON.parse(ev.data as string) } catch { this.emit('fault', { code: 'INVALID_MESSAGE' }); return }
         if (msg.event) {
           if (msg.event === 'state' || msg.event === 'members') this.state = msg.result
+          if (msg.event === 'state') { window.clearTimeout(timer); resolve(this) }
+          if (msg.event === 'closed') this.state = this.state ? { ...this.state, room: null, hostId: null, members: [] } : null
           this.emit(msg.event, msg.result)
           return
         }
@@ -70,6 +75,7 @@ export class NetClient {
       ws.onclose = () => {
         window.clearTimeout(timer)
         this.connecting = null
+        reject(new Error('BRIDGE_CLOSED'))
         for (const p of this.pending.values()) {
           window.clearTimeout(p.timer)
           p.reject(new Error('BRIDGE_CLOSED'))
@@ -98,12 +104,19 @@ export class NetClient {
     })
   }
 
-  createRoom() { return this.request<NetInfo>('create') }
-  joinRoom(room: string) { return this.request<NetInfo>('join', { room }) }
+  createRoom() { return this.request<NetInfo>('create').then((s) => (this.state = s)) }
+  joinRoom(room: string) { return this.request<NetInfo>('join', { room }).then((s) => (this.state = s)) }
   send(to: string, data: Record<string, unknown>) { return this.request('send', { to, data }) }
-  leave() { return this.request<NetInfo>('leave') }
+  leave() { return this.request<NetInfo>('leave').then((s) => (this.state = s)) }
 
-  close() {
-    this.ws?.close()
+  close(): Promise<void> {
+    if (this.closing) return this.closing
+    const ws = this.ws
+    if (!ws || ws.readyState === WebSocket.CLOSED) return Promise.resolve()
+    this.closing = new Promise<void>((resolve) => {
+      ws.addEventListener('close', () => resolve(), { once: true })
+      ws.close()
+    })
+    return this.closing
   }
 }

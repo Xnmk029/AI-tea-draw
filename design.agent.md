@@ -1,7 +1,7 @@
 # TeaDraw · design.agent.md（Agent 审阅版）
 
 > 读者：接手开发的 AI Agent。人类阅读版是 `design.md`。
-> 状态快照：v0.3 UI demo，2026-10-05。代码是事实来源；本文与代码冲突时**以代码为准，并更新本文**。
+> 状态快照：v0.3 UI demo，2026-10-06。代码是事实来源；本文与代码冲突时**以代码为准，并更新本文**。
 > 语言：与用户对话用中文；代码注释保持现有风格（简短中文，按需）。
 
 ---
@@ -50,6 +50,9 @@ src/
     simulation.ts      远端玩家 / Agent 的脚本（startSimulation(SimCtx)）
     liveAgent.ts       真实 Agent 的 12 个工具处理器（canvas_draw → 描红/落定；坐标契约=帧局部坐标）
     mcpClient.ts       浏览器 ↔ teadraw 桥的 WS 客户端（自动重连；LivePeer 状态）
+    useNetRoom.ts      App 常驻房间会话：大厅/对局/结算阶段、完整房规与座位、建房入房及续连
+    netSync.ts         session/game 订阅、gameId 隔离、顺序发送、大包分块及切屏消息缓存
+    netClient.ts       浏览器 ↔ 每玩家本机联机桥的 WS 客户端
     engine.ts          buildBatch / mergeBatches / animateOps / makePen / uid
     targeting.ts       落笔指引：DrawTarget、手势分类、fitContent、锚定、占用网格、findSpace
     Canvas.tsx         SVG 画布、指针输入、rAF 驱动的远端光标、草稿与标记渲染
@@ -115,7 +118,7 @@ server/
 
 - `.l-hud` 和 `.l-panel` 本身 `pointer-events: none`，它们的直接子元素用 `:where()` 恢复为 auto（特异性为 0，组件自己的 `pointer-events: none` 仍然生效，比如 `.topbar`）。
 - **注意类名冲突**：舞台层用 `.stage-layer`，**不能用 `.layer`**，那是侧栏"图层"行的类名（固定 38px 高，曾经导致弹窗塌缩）。
-- 换屏统一走 `App.go(screen)`：卷帘落下 420ms → 换屏 → 收起 520ms。转场期间 `busy` 锁住，重复调用会被忽略。
+- 换屏统一走 `App.go(screen)`：卷帘落下 420ms → 换屏 → 收起 520ms。转场期间 `busy` 锁住，最新待转屏请求保存在 `pendingScreen`，收起后继续处理，避免联机房间状态变化被吞掉。
 - Esc：`useBack(fn, active)` 是一个栈，最后注册的先响应；焦点在输入框时，Esc 只让输入框失焦。对局里的 Esc（拒绝草稿、清除标记）由 `useGame` 处理，**对局屏不注册 useBack**。
 - 屏幕快捷键用 `useHotkeys(map)`，输入框内和带 Ctrl/Meta/Alt 时不触发。按键提示用 `<Key k="Enter" />`。
 
@@ -145,6 +148,7 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 - Pen key：远端人类为 `${seatId}-human`，Agent 为 `${seatId}-agent`；我的 Agent 是 `${me.id}-agent`。`pen.batch.end` 是**时长**，不是时间戳。
 - 动画用 CSS 类 `.draw`，配合 `pathLength=1`，以及 `--delay`、`--dur`。**注意**：任何祖先元素都不要带 `.draw` 类，`stroke-dasharray` 会被子元素继承，曾经导致相册缩略图整体变成虚线（传话相册卡片现在用 `k-draw`）。
 - activity 里的 MCP 工具名与真实 MCP 一致：`turn_get_task`、`canvas_get_targets`、`canvas_find_space`、`canvas_snapshot`、`canvas_describe`、`canvas_draw`、`canvas_commit`、`preview_accept`、`preview_reject`、`chat_send`、`guess_submit`、`hint_whisper`、`events_poll`、`room_state`、`task_push`。模拟链路的日志前缀相同，但真实链路下这些日志是**真实调用发生时**才写入的。
+- 联机时人类与 Agent 统一经过 Host 的 `buildAuthorizedOps → applyCommittedOps`，校验当前画手/回合、SVG 属性、几何与墨量，然后广播；Peer 的直接提交和草稿盖章都等待 Host 回显。MCP 角色与座位动态读取，猜词/聊天也向 Host 提交，联机悄悄提示禁用。
 
 ## 5.1 局流程（多轮、恢复、结算载荷）
 
@@ -153,7 +157,7 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 - **主题**：`rules.theme`（茶单·回合可改）→ TopBar 主题、任务文案、结算标题；空则用 `TEA_THEME`。
 - **避让**：`rules.avoidOthers !== false`（默认开，茶单有开关）控制 `occOverlap→nudgeFree` 微挪，sim 与 liveAgent 两条链路共用。
 - **结算载荷**：`g.collectResult(): SessionResult`（seats/ops/inkStats/guessStats/rounds/theme/durationMs）→ `GameScreen.finish` → `App.lastResult` → `ResultScreen`。**无 result 时结算屏回退演示数据**（深链直达仍可用）。回放用 `OpsView`（真实 op 渲染，复用 `.draw` CSS）；导出 SVG/PNG 是真实下载。
-- **持久化**：ops/比分/轮次自动存 `localStorage['teadraw:save:{mode}:{role}']`（800ms 防抖）；`?resume=1` 恢复并提示。
+- **持久化**：单机 ops/比分/轮次自动存 `localStorage['teadraw:save:{mode}:{role}']`（800ms 防抖），`?resume=1` 恢复。联机房间配置与阶段存 sessionStorage；Host 核心状态按 `room+gameId` 保存，刷新续连恢复原局；Peer 从 Host 请求快照。联机不会读入单机演示存档，存储不足或桥断开超过 30 秒不保证恢复。
 - **错误兜底**：`ErrorBoundary` 包住 .stage 内容，崩溃给纸样式错误卡（提示 ?resume=1）。
 - **Agent 感知**：`liveRef.notifyOps/notifyOpsRemoved` 挂在 draw/addOps/runBatch/erase/undo 上 → `events_poll` 的 `ops`/`ops_removed` 事件，真实 Agent 能看到别人落了什么笔。
 
@@ -209,11 +213,15 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 - **验收已过**：手画线与 Agent 素材同渲染、mask 揭幕逐笔、洇散底衬可见；tsc/build 通过，笔迹层独立 chunk（78KB 按需加载）
 
 ### T3 联网（Host 权威）
-- Op 广播格式：`{ op:'add'|'remove', id, seat, author, layer, el, tf, ink, t }`。由 Host 统一排序、校验、扣墨量，然后广播。
-- 中途加入：先下发快照，再补增量日志。
+- 大厅/对局/结算由 App 的 `useNetRoom` 常驻会话连接，UI 卸载只取消订阅；`netSync` 区分 session/game 通道，gameId 隔离新局，round 校验旧轮，`game-ready→hello→snapshot` 处理切屏期间补水。
+- 茶绘与猜词已接大厅完整玩法/房规/座位同步，Host 统一校验人/Agent 操作并保留 author/笔速动画。传话联机明确禁用，真实 Steam 双账号仍需验收。
+- 桥断 socket 保留身份 30 秒，主动 leave 立即离房；Host 按 room+gameId 同步保存 sessionStorage 核心状态供刷新恢复，peer 向 Host 请求快照。断线显示错误并阻止本地分裂，不静默回退单机。
+- 验证入口：`node server/test-net-lifecycle.mjs`、`node server/test-net-client.mjs`、`node tools/net-lobby-e2e.mjs`；后一项从真实首页菜单开始，覆盖人/Agent双向绘图、刷新、猜词轮换、结算与再开，输出 `test-output/net-regression/`（忽略提交）。
+- Op 广播格式：`{t:'ops',gameId,round,ops:Op[]}`，删除为 `{t:'op-del',gameId,ids}`。Host 编号、校验、计算墨量及 Agent 动画后广播，详见 `design.net.md`。
+- 中途加入：`hello → seat-assign/roster/snapshot` 注水后继续接收增量；尚无独立持久化增量日志或 Host 迁移。
 - 网络层复用团队已有的 Steam P2P（SpaceWar）组件。
 - `simulation.ts` 只保留为离线模式和测试用。
-- **验收**：两个客户端完成三种玩法，画面一致；在客户端篡改 SVG 会被 Host 拒绝。
+- **当前验收**：本地 Mock 生命周期 6 项、TS 客户端协议 7 项、完整菜单双浏览器 33 项，共 46 项通过（2026-10-06），含人/Agent 双向同步、SVG 篡改、猜词者绘图拒绝、双方刷新、猜词轮换、结算及再开。传话联机与真实 Steam 双账号仍为待验收范围。
 
 ### T4 音频
 - 新建 `AudioManager`，分 music / sfx / ambient 三条通道，音量接到设置面板。

@@ -16,6 +16,8 @@ interface Props {
   mode: ModeId
   onMode: (m: ModeId) => void
   onEnter: () => void
+  /** 联机会话下输入房间码真实进房（未接 net 时为 undefined，回退 Demo 行为） */
+  onJoin?: (code: string) => void
 }
 
 type PanelId = 'play' | 'join' | 'pet' | 'gallery' | 'settings' | 'quit'
@@ -37,7 +39,7 @@ const BG_SCENE: SceneItem[] = [
   { key: 'sun', x: 300, y: 0, s: 0.5 },
 ]
 
-export function HomeScreen({ mode, onMode, onEnter }: Props) {
+export function HomeScreen({ mode, onMode, onEnter, onJoin }: Props) {
   const [focus, setFocus] = useState(0)
   const [panel, setPanel] = useState<PanelId | null>(null)
   const me = INITIAL_SEATS[0]
@@ -166,7 +168,7 @@ export function HomeScreen({ mode, onMode, onEnter }: Props) {
         {panel && (
           <section key={panel} className="sheet home-sheet">
             {panel === 'play' && <PlayPanel mode={mode} onMode={onMode} onEnter={onEnter} />}
-            {panel === 'join' && <JoinPanel onEnter={onEnter} />}
+            {panel === 'join' && <JoinPanel onEnter={onEnter} onJoin={onJoin} />}
             {panel === 'pet' && <PetPanel />}
             {panel === 'settings' && <SettingsPanel />}
             {panel === 'quit' && (
@@ -240,40 +242,58 @@ function PlayPanel({ mode, onMode, onEnter }: { mode: ModeId; onMode: (m: ModeId
   )
 }
 
-function JoinPanel({ onEnter }: { onEnter: () => void }) {
+function JoinPanel({ onEnter, onJoin }: { onEnter: () => void; onJoin?: (code: string) => void }) {
   const [code, setCode] = useState('')
+  // 联机：数字 mock 码或 15–21 位 Steam lobby 码；单机 demo 仍按 4 位走
+  const ok = onJoin ? /^\d{4,21}$/.test(code) : code.length === 4
+  const submit = () => {
+    if (!ok) return
+    if (onJoin) onJoin(code)
+    else onEnter()
+  }
   return (
-    <SheetBody title="加入房间" sub="向房主要四位房间码，或者直接跟随好友">
-      <label className="code-boxes">
-        <input autoFocus value={code} maxLength={4} onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))} onKeyDown={(e) => e.key === 'Enter' && code.length === 4 && onEnter()} />
-        {Array.from({ length: 4 }).map((_, i) => (
+    <SheetBody title="加入房间" sub={onJoin ? '输入房主的数字房间码（测试码或 Steam 大厅码）' : '向房主要四位房间码，或者直接跟随好友'}>
+      <label className={`code-boxes ${onJoin ? 'wide' : ''}`}>
+        <input
+          autoFocus
+          value={code}
+          maxLength={onJoin ? 21 : 4}
+          aria-label="房间码"
+          placeholder={onJoin ? '粘贴房主的房间码' : undefined}
+          onChange={(e) => setCode(onJoin ? e.target.value.replace(/\D/g, '') : e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+          onKeyDown={(e) => e.key === 'Enter' && ok && submit()}
+        />
+        {!onJoin && Array.from({ length: 4 }).map((_, i) => (
           <span key={i} className={i === code.length ? 'cur' : ''}>
             {code[i] ?? ''}
           </span>
         ))}
       </label>
-      <button className="gbtn primary wide" disabled={code.length < 4} onClick={onEnter}>
+      <button className="gbtn primary wide" disabled={!ok} onClick={submit}>
         入座 <Key k="Enter" />
       </button>
-      <div className="sheet-sec">好友</div>
-      <div className="friend-rows">
-        {FRIENDS.map((f) => (
-          <div key={f.name} className="friend-row">
-            <Avatar seat={{ name: f.name, color: f.color, agent: null }} size={40} />
-            <div>
-              <b>{f.name}</b>
-              <span>{f.status}</span>
+      {/* 联机时隐藏 mock 好友列表（好友跟随功能未实装） */}
+      {!onJoin && <div className="sheet-sec">好友</div>}
+      {!onJoin && (
+        <div className="friend-rows">
+          {FRIENDS.map((f) => (
+            <div key={f.name} className="friend-row">
+              <Avatar seat={{ name: f.name, color: f.color, agent: null }} size={40} />
+              <div>
+                <b>{f.name}</b>
+                <span>{f.status}</span>
+              </div>
+              {f.room ? (
+                <button className="gbtn sm" onClick={onEnter}>
+                  跟随加入
+                </button>
+              ) : (
+                <button className="gbtn sm ghost">邀请</button>
+              )}
             </div>
-            {f.room ? (
-              <button className="gbtn sm" onClick={onEnter}>
-                跟随加入
-              </button>
-            ) : (
-              <button className="gbtn sm ghost">邀请</button>
-            )}
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
     </SheetBody>
   )
 }

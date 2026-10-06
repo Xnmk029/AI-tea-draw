@@ -26,6 +26,10 @@ export interface NetLink {
   hostId: string
   room: string
   transport: string
+  gameId: string
+  seatRoster?: { peerId: string; seat: number; name: string; color: string }[]
+  setGame(id: string): void
+  subscribe(hooks: NetHooks, channel?: 'session' | 'game'): () => void
   /** peer→host 发意图；host 调用无意义 */
   intent(msg: RoomMsg): void
   /** host→全体成员广播 */
@@ -33,7 +37,8 @@ export interface NetLink {
   /** host→指定成员定向发 */
   to(peerId: string, msg: RoomMsg): void
   members(): string[]
-  close(): void
+  close(): Promise<void>
+  disconnect(): Promise<void>
 }
 
 export interface NetHooks {
@@ -43,35 +48,132 @@ export interface NetHooks {
   onMembers?: (members: string[]) => void
   /** 传输层断开/故障（BRIDGE_CLOSED / HOST_LEFT / fault） */
   onClose?: (reason: string) => void
+  onError?: (reason: string) => void
 }
 
-/** 建/进房并装配 NetLink；失败抛错由调用方兜底（回退单机） */
+/** 建/进房并装配 NetLink；失败抛错由常驻会话显示错误和重试 */
 export async function connectNet(params: NetParams, hooks: NetHooks): Promise<NetLink> {
   const client = new NetClient(params.port, params.token)
-  client.on('packet', (p: NetPacket) => hooks.onPacket(p.from, p.data as RoomMsg))
-  client.on('members', (r) => hooks.onMembers?.((r as NetInfo).members ?? []))
-  client.on('closed', (r) => hooks.onClose?.((r as { reason?: string }).reason ?? 'CLOSED'))
-  client.on('fault', (r) => hooks.onClose?.(`FAULT:${JSON.stringify(r)}`))
-  await client.connect()
+  const listeners = new Set<{ hooks: NetHooks; channel: 'session' | 'game' }>([{ hooks, channel: 'session' }])
+  let buffered: NetPacket[] = []
+  let bufferedSize = 0
+  let link: NetLink | undefined
+  let stopped = false
+  let sending = Promise.resolve()
+  const chunks = new Map<string, { total: number; parts: Map<number, string>; size: number; timer: number }>()
+  const clearChunks = () => { chunks.forEach((entry) => window.clearTimeout(entry.timer)); chunks.clear() }
+  const each = (fn: (h: NetHooks) => void) => listeners.forEach((l) => fn(l.hooks))
+  const error = (e: unknown) => each((h) => h.onError?.(e instanceof Error ? e.message : String(e)))
+  const gameplay = (m: RoomMsg) => m.t === 'session-over' || (!m.t.startsWith('lobby-') && !m.t.startsWith('session-'))
+  client.on('packet', (p: NetPacket) => {
+    if (stopped || !p.data || typeof p.data.t !== 'string') return
+    if (link && (link.role === 'peer' ? p.from !== link.hostId : !link.members().includes(p.from))) return
+    let msg = p.data as RoomMsg
+    if (msg.t === 'session-chunk') {
+      const { id, index, total, chunk } = msg
+      if (typeof id !== 'string' || id.length > 80 || !Number.isInteger(index) || !Number.isInteger(total) || (total as number) < 1 || (total as number) > 400 || (index as number) < 0 || (index as number) >= (total as number) || typeof chunk !== 'string' || chunk.length > 48000) return
+      const key = `${p.from}:${id}`
+      if (!chunks.has(key)) {
+        if (chunks.size >= 8) return
+        chunks.set(key, { total: total as number, parts: new Map(), size: 0, timer: window.setTimeout(() => chunks.delete(key), 15000) })
+      }
+      const entry = chunks.get(key)!
+      if (entry.total !== total || entry.parts.has(index as number)) return
+      entry.parts.set(index as number, chunk)
+      entry.size += chunk.length
+      if ([...chunks.values()].reduce((size, item) => size + item.size, 0) > 16 * 1024 * 1024) { window.clearTimeout(entry.timer); chunks.delete(key); error(new Error('GAME_PACKET_TOO_LARGE')); return }
+      if (entry.parts.size !== entry.total) return
+      chunks.delete(key)
+      window.clearTimeout(entry.timer)
+      try { msg = JSON.parse(Array.from({ length: entry.total }, (_, i) => entry.parts.get(i)).join('')) } catch { return }
+      if (!msg || typeof msg.t !== 'string' || msg.t === 'session-chunk') return
+      p = { from: p.from, data: msg }
+    }
+    for (const l of listeners) if (l.channel === 'session') l.hooks.onPacket(p.from, msg)
+    if (!gameplay(msg) || (link && msg.gameId !== link.gameId)) return
+    const games = [...listeners].filter((l) => l.channel === 'game')
+    if (!games.length) { buffered.push(p); bufferedSize += JSON.stringify(msg).length }
+    else games.forEach((l) => l.hooks.onPacket(p.from, msg))
+    if (buffered.length > 512 || bufferedSize > 16 * 1024 * 1024) { buffered = []; bufferedSize = 0; error(new Error('GAME_SYNC_REQUIRED')) }
+  })
+  client.on('members', (r) => each((h) => h.onMembers?.((r as NetInfo).members ?? [])))
+  client.on('closed', (r) => {
+    if (stopped) return
+    stopped = true
+    clearChunks()
+    each((h) => h.onClose?.((r as { reason?: string }).reason ?? 'CLOSED'))
+  })
+  client.on('fault', (r) => error(`FAULT:${JSON.stringify(r)}`))
 
-  const info = params.room ? await client.joinRoom(params.room) : await client.createRoom()
+  let info: NetInfo
+  try {
+    await client.connect()
+    const current = client.state
+    info = current?.room && (!params.room || current.room === params.room)
+      ? current
+      : params.room ? await client.joinRoom(params.room) : await client.createRoom()
+  } catch (e) {
+    // 建/进房失败也要放掉 WS，否则桥的客户端槽位被占，刷新重连会 409
+    stopped = true
+    client.close()
+    throw e
+  }
   const role: NetLink['role'] = info.hostId === info.selfId ? 'host' : 'peer'
 
-  const link: NetLink = {
+  const send = (to: string, msg: RoomMsg) => {
+    if (stopped) return
+    const payload = gameplay(msg) ? { ...msg, gameId: link!.gameId } : msg
+    sending = sending.then(async () => {
+      if (stopped) return
+      const body = JSON.stringify(payload)
+      if (body.length > 16 * 1024 * 1024) throw new Error('GAME_PACKET_TOO_LARGE')
+      if (body.length <= 48000) { await client.send(to, payload); return }
+      const id = crypto.randomUUID()
+      const total = Math.ceil(body.length / 48000)
+      for (let index = 0; index < total && !stopped; index++) await client.send(to, { t: 'session-chunk', id, index, total, chunk: body.slice(index * 48000, (index + 1) * 48000) })
+    }).catch(error)
+  }
+  link = {
     role,
     selfId: info.selfId,
     hostId: info.hostId ?? info.selfId,
     room: info.room ?? '',
     transport: info.transport,
-    intent: (msg) => void client.send(link.hostId, msg).catch(() => {}),
+    gameId: `${info.room}:initial`,
+    setGame: (id) => {
+      if (link!.gameId === id) return
+      link!.gameId = id
+      buffered = []
+      bufferedSize = 0
+      clearChunks()
+    },
+    subscribe: (h, channel = 'session') => {
+      const listener = { hooks: h, channel }
+      listeners.add(listener)
+      h.onMembers?.(client.state?.members ?? [])
+      if (channel === 'game') {
+        const queued = buffered
+        buffered = []
+        bufferedSize = 0
+        for (const p of queued) if (p.data.gameId === link!.gameId) h.onPacket(p.from, p.data as RoomMsg)
+      }
+      return () => { listeners.delete(listener) }
+    },
+    intent: (msg) => send(link!.hostId, msg),
     broadcast: (msg) => {
       for (const m of client.state?.members ?? []) {
-        if (m !== link.selfId) void client.send(m, msg).catch(() => {})
+        if (m !== link!.selfId) send(m, msg)
       }
     },
-    to: (peerId, msg) => void client.send(peerId, msg).catch(() => {}),
+    to: send,
     members: () => client.state?.members ?? [],
-    close: () => client.close(),
+    close: () => {
+      stopped = true
+      listeners.clear()
+      clearChunks()
+      return client.leave().then(() => {}, () => {}).finally(() => client.close())
+    },
+    disconnect: () => { stopped = true; listeners.clear(); clearChunks(); return client.close() },
   }
 
   if (role === 'peer') link.intent({ t: 'hello', name: params.name ?? '茶客' })

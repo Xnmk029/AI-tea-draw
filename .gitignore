@@ -5,3 +5,5 @@ dist
 assets-src/
 # 素材原始包（百 MB 级，成品在 public/assets）
 assets-src/
+teadraw-pack*.zip
+test-output/

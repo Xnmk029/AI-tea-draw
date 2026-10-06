@@ -3,8 +3,8 @@ const { WebSocketServer, WebSocket } = require('ws');
 const { randomUUID } = require('node:crypto');
 const { MAX_PACKET_BYTES, VERSION, validateProject } = require('./protocol.cjs');
 
-async function startHub({ port = 0, latency = 0 } = {}) {
-  const server = new WebSocketServer({ host: '127.0.0.1', port, maxPayload: MAX_PACKET_BYTES });
+async function startHub({ port = 0, latency = 0, host = '127.0.0.1' } = {}) {
+  const server = new WebSocketServer({ host, port, maxPayload: MAX_PACKET_BYTES });
   const rooms = new Map(); const peers = new Map(); const timers = new Set();
   let roomSeq = 1000;
   function deliver(ws, value) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value)); }
@@ -59,7 +59,7 @@ async function startHub({ port = 0, latency = 0 } = {}) {
   });
   await new Promise((resolve, reject) => { server.once('listening', resolve); server.once('error', reject); });
   return {
-    url: `ws://127.0.0.1:${server.address().port}`, rooms,
+    url: `ws://${host}:${server.address().port}`, host, rooms,
     close: async () => { for (const timer of timers) clearTimeout(timer); for (const p of peers.values()) p.ws.terminate(); await new Promise(resolve => server.close(resolve)); }
   };
 }

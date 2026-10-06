@@ -55,13 +55,18 @@ export interface LiveCtx {
   markUsed: (ids: string[]) => void
   clearMarks: () => void
   showToast: (text: string) => void
-  commitOps: (batch: Batch) => void
-  acceptGhost: () => void
+  commitOps: (batch: Batch) => string[] | null
+  acceptGhost: () => string[] | null
   getPen: (key: string) => Pen | undefined
   /** 本轮画手座位（猜词视角轮换） */
   drawerSeat: () => number
   /** 本场传话题目（网文标题池抽取或房规指定） */
   relayTitle: string
+  online?: () => boolean
+  net?: () => boolean
+  room?: () => string
+  submitGuess?: (text: string) => void
+  sendChat?: (text: string) => void
 }
 
 interface LiveEvent {
@@ -102,10 +107,11 @@ const elSvg = (el: SvgEl) =>
     .join(' ')}/>`
 
 export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): LiveHandle {
-  const { mode, role, rules, meId } = ctx
-  const myKey = agentPenKey(meId)
-  const readOnly = mode === 'guess' && role === 'guesser'
-  const seatColor = () => ctx.state().seats.find((s) => s.id === meId)?.color ?? '#888'
+  const { mode, rules } = ctx
+  const meId = () => ctx.meId
+  const myKey = () => agentPenKey(meId())
+  const readOnly = () => mode === 'guess' && ctx.role === 'guesser'
+  const seatColor = () => ctx.state().seats.find((s) => s.id === meId())?.color ?? '#888'
 
   let seq = 0
   const events: LiveEvent[] = []
@@ -189,7 +195,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
           theme: mode === 'tea' ? rules.theme || TEA_THEME : undefined,
           prompt: mode === 'relay' ? ctx.relayTitle : undefined,
           step: mode === 'relay' ? RELAY_STEP : undefined,
-          word: mode === 'guess' && role === 'drawer' ? L.word?.word : undefined,
+          word: mode === 'guess' && ctx.role === 'drawer' ? L.word?.word : undefined,
           targets: ctx.state().marks.length,
           ink: { used: L.ink.agent, allowance: Math.round(L.ink.allowance), remaining: Math.max(0, Math.round(L.ink.allowance - L.ink.agent)) },
           rules: { penSpeed: rules.penSpeed, inkRatio: rules.inkRatio, targetFit: rules.targetFit, svgPreset: rules.svgPreset, maxMarks: MAX_MARKS },
@@ -224,7 +230,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
 
     canvas_snapshot: async (a) => {
       const region = regionFor(a?.targetId)
-      ctx.log('canvas_snapshot', `png · ${Math.round(region.w)}×${Math.round(region.h)}${readOnly ? '（仅光栅图，无 SVG 源）' : ''}`, 'muted')
+      ctx.log('canvas_snapshot', `png · ${Math.round(region.w)}×${Math.round(region.h)}${readOnly() ? '（仅光栅图，无 SVG 源）' : ''}`, 'muted')
       const img = await rasterize(region)
       return { content: [{ type: 'image', data: img.data, mimeType: 'image/png' }, { type: 'text', text: JSON.stringify({ w: img.w, h: img.h, region }) }] }
     },
@@ -251,7 +257,10 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
 
     canvas_draw: (a) => {
       const L = ctx.state()
-      if (readOnly) return err('猜词者的 Agent 不能落笔')
+      if (readOnly()) return err('猜词者的 Agent 不能落笔')
+      if (ctx.online && !ctx.online()) return err('联机会话正在恢复，请稍后重试', 'net_unavailable')
+      if (rules.agentLevel === 'off') return err('本房间已关闭 Agent 落笔')
+      if (mode === 'guess' && !L.word) return err('本轮画手还未选词')
       if (L.roundOver) return err('本轮已结束')
       if (mode === 'relay' && L.submitted) return err('画作已提交')
       if (L.ghost) return err('还有一张草稿待确认（等玩家盖章或揉掉）', 'preview_pending')
@@ -309,7 +318,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
         p.markIds.forEach((id) => usedIds.add(id))
       }
 
-      const previewOps = placements.flatMap((pl) => buildBatch(pl.els, { seat: meId, author: 'agent', tf: pl.tf, label: pendingTask?.text.slice(0, 24) }).ops)
+      const previewOps = placements.flatMap((pl) => buildBatch(pl.els, { seat: meId(), author: 'agent', tf: pl.tf, label: pendingTask?.text.slice(0, 24) }).ops)
       const inkNeed = previewOps.reduce((n, o) => n + o.ink, 0)
       if (L.ink.agent + inkNeed > L.ink.allowance) {
         ctx.log('canvas_draw', `已拒绝 · 墨量 ${inkNeed} 超出剩余 ${Math.max(0, Math.round(L.ink.allowance - L.ink.agent))}`, 'warn')
@@ -327,77 +336,90 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       ctx.markUsed([...usedIds])
       ctx.log('canvas_draw', `${previewOps.length} 个元素 · ${wantsCommit ? 'commit' : 'preview'}${taskText ? ` · 任务「${taskText}」` : ''}`)
 
-      const pen = ctx.getPen(myKey)
+      const pen = ctx.getPen(myKey())
       const first = previewOps[0]
       if (pen && first) {
         const p0 = elStart(first.el, first.tf)
         pen.target = { ...p0 }
         pen.visible = true
-        pen.label = `我的 ${ctx.state().seats.find((s) => s.id === meId)?.agent?.name ?? 'Agent'}`
+        pen.label = `我的 ${ctx.state().seats.find((s) => s.id === meId())?.agent?.name ?? 'Agent'}`
       }
-      ctx.think(myKey, null)
+      ctx.think(myKey(), null)
 
       if (!wantsCommit) {
         const previewId = uid('pv')
-        ctx.patchAgent(meId, 'review')
+        ctx.patchAgent(meId(), 'review')
         ctx.setGhost({ ops: previewOps, label: taskText ?? 'Agent 稿件', ink: inkNeed, notes, previewId })
         emit('preview', { result: 'set', previewId, ink: inkNeed })
         return ok({ previewId, ink: inkNeed, removed: report.removed, stripped: report.stripped, note: '等玩家盖章（Tab）或揉掉（Esc），用 events_poll 等结果' })
       }
 
-      ctx.patchAgent(meId, 'drawing')
+      ctx.patchAgent(meId(), 'drawing')
       ctx.log('canvas_commit', `墨量 ${inkNeed}`, 'ok')
-      ctx.commitOps(animateOps(previewOps, rules.penSpeed))
-      emit('commit', { ink: inkNeed })
-      return ok({ opIds: previewOps.map((o) => o.id), ink: inkNeed, removed: report.removed, stripped: report.stripped })
+      const opIds = ctx.commitOps(animateOps(previewOps, rules.penSpeed))
+      if (opIds?.length === 0) return err('落笔被房规拒绝', 'commit_rejected')
+      emit('commit', { ink: inkNeed, opIds, pending: opIds === null })
+      return ok({ opIds: opIds ?? [], pending: opIds === null, ink: inkNeed, removed: report.removed, stripped: report.stripped })
     },
 
     canvas_commit: (a) => {
       const L = ctx.state()
+      if (readOnly() || L.roundOver) return err('当前回合不能落笔')
+      if (ctx.online && !ctx.online()) return err('联机会话正在恢复，请稍后重试', 'net_unavailable')
       if (rules.agentLevel === 'assist') return err('助手档：草稿只能由玩家盖章确认', 'host_confirm')
       const g = L.ghost
       if (!g || (a?.previewId && g.previewId !== a.previewId)) return err('没有匹配的待审草稿', 'no_preview')
-      ctx.acceptGhost()
-      return ok({ opIds: g.ops.map((o) => o.id), ink: g.ink })
+      const opIds = ctx.acceptGhost()
+      if (opIds?.length === 0) return err('落笔被房规拒绝', 'commit_rejected')
+      return ok({ opIds: opIds ?? [], pending: opIds === null, ink: g.ink })
     },
 
     chat_send: (a) => {
       const text = String(a?.text ?? '').trim().slice(0, 140)
       if (!text) return err('空消息')
-      ctx.say({ seat: meId, author: 'agent', text })
+      if (mode === 'guess' && !readOnly() && !ctx.state().roundOver) return err('画手不能在聊天里发言')
+      if (ctx.online && !ctx.online()) return err('联机会话正在恢复，请稍后重试', 'net_unavailable')
+      if (ctx.net?.() && ctx.sendChat) ctx.sendChat(text)
+      else ctx.say({ seat: meId(), author: 'agent', text })
       ctx.log('chat_send', text.slice(0, 40))
       return ok({ sent: true })
     },
 
     guess_submit: (a) => {
-      if (!readOnly) return err('只有猜词方的 Agent 能提交猜测')
+      if (!readOnly()) return err('只有猜词方的 Agent 能提交猜测')
       if (rules.guesserAgent === 'off') return err('本房间未开启猜词方 Agent')
       const L = ctx.state()
       if (L.guessed || L.roundOver) return err('你已经猜中 / 本轮已结束')
       const text = String(a?.text ?? '').trim()
       if (!text) return err('空猜测')
+      if (ctx.online && !ctx.online()) return err('联机会话正在恢复，请稍后重试', 'net_unavailable')
+      if (ctx.net?.() && ctx.submitGuess) {
+        ctx.submitGuess(text)
+        return ok({ result: 'pending', note: '由房主判定，结果经 guess-result 同步' })
+      }
       const r = judgeGuess(text, L.roundTarget)
       ctx.log('guess_submit', `「${text}」→ ${r}`, r === 'correct' ? 'ok' : r === 'close' ? 'warn' : 'muted')
       if (r === 'correct') {
         const pts = Math.max(50, Math.round((Math.max(100, Math.round(((L.timeLeft ?? 0) / rules.roundTime) * 300))) / 2))
-        ctx.score(meId, pts)
+        ctx.score(meId(), pts)
         ctx.score(ctx.drawerSeat(), 40)
-        ctx.say({ seat: meId, author: 'system', text: `${ctx.state().seats.find((s) => s.id === meId)?.agent?.name ?? 'Agent'} 帮你猜中了！+${pts}（Agent 提示 ×0.5）`, kind: 'correct' })
-        ctx.markGuessed(meId)
+        ctx.say({ seat: meId(), author: 'system', text: `${ctx.state().seats.find((s) => s.id === meId())?.agent?.name ?? 'Agent'} 帮你猜中了！+${pts}（Agent 提示 ×0.5）`, kind: 'correct' })
+        ctx.markGuessed(meId())
         return ok({ result: 'correct', pts })
       }
-      if (r === 'close') ctx.say({ seat: meId, author: 'system', text: `Agent 猜「${text}」很接近了`, kind: 'close' })
-      else ctx.say({ seat: meId, author: 'agent', text: `我猜猜……${text}` })
+      if (r === 'close') ctx.say({ seat: meId(), author: 'system', text: `Agent 猜「${text}」很接近了`, kind: 'close' })
+      else ctx.say({ seat: meId(), author: 'agent', text: `我猜猜……${text}` })
       return ok({ result: r })
     },
 
     hint_whisper: () => {
-      if (!readOnly) return err('只有猜词方能收到悄悄提示')
+      if (!readOnly()) return err('只有猜词方能收到悄悄提示')
+      if (ctx.net?.()) return err('联机模式不向猜词方提供答案提示')
       if (rules.guesserAgent !== 'whisper') return err('本房间未开启悄悄提示')
       const r = ctx.state().round
       if (whisperRound === r) return err('本轮已提示过')
       whisperRound = r
-      ctx.say({ seat: meId, author: 'agent', text: '（悄悄提示已送达）' })
+      ctx.say({ seat: meId(), author: 'agent', text: '（悄悄提示已送达）' })
       ctx.log('hint_whisper', '悄悄提示已送达 · 猜中得分 ×0.5', 'ok')
       emit('whisper', {})
       return ok({ text: whisperFor(ctx.state().roundTarget) })
@@ -412,26 +434,32 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       const L = ctx.state()
       ctx.log('room_state', `${mode} · ${ctx.state().seats.filter((s) => s.online).length} 人在线`)
       return ok({
-        room: ROOM_CODE,
+        room: ctx.room?.() ?? ROOM_CODE,
         mode,
-        role,
+        role: ctx.role,
         seats: L.seats.map((s) => ({ id: s.id, name: s.name, color: s.color, ready: s.ready, online: s.online, agent: s.agent ? { name: s.agent.name, model: s.agent.model, status: s.agent.status } : null })),
         rules: { agentLevel: rules.agentLevel, guesserAgent: rules.guesserAgent, inkRatio: rules.inkRatio, penSpeed: rules.penSpeed, roundTime: rules.roundTime, svgPreset: rules.svgPreset, targetFit: rules.targetFit, targetsPublic: rules.targetsPublic, maxMarks: MAX_MARKS },
-        me: { seat: meId, color: seatColor(), ink: { human: Math.round(L.ink.human), agent: Math.round(L.ink.agent), allowance: Math.round(L.ink.allowance) } },
+        me: { seat: meId(), color: seatColor(), ink: { human: Math.round(L.ink.human), agent: Math.round(L.ink.agent), allowance: Math.round(L.ink.allowance) } },
         ghost: L.ghost ? { previewId: L.ghost.previewId, ink: L.ghost.ink } : null,
-        word: mode === 'guess' && role === 'drawer' ? L.word?.word ?? null : undefined,
+        word: mode === 'guess' && ctx.role === 'drawer' ? L.word?.word ?? null : undefined,
       })
     },
   }
 
   // 猜词方：悄悄提示每轮一条（live 路径沿用 whisper ×0.5 的计分语义）
   let whisperRound = 0
+  let activeRound = ctx.state().round
 
   const client = new McpClient({
     url: WS_URL,
-    join: () => ({ room: ROOM_CODE, seat: meId, me: { name: ctx.state().seats.find((s) => s.id === meId)?.name } }),
+    join: () => ({ room: ctx.room?.() ?? ROOM_CODE, seat: meId(), me: { name: ctx.state().seats.find((s) => s.id === meId())?.name } }),
     onPeer,
     onCall: async (name, args) => {
+      if (activeRound !== ctx.state().round) {
+        activeRound = ctx.state().round
+        pendingTask = null
+        spaceCache.clear()
+      }
       const h = handlers[name]
       if (!h) return err(`未知工具：${name}`, 'unknown_tool')
       try {
@@ -451,7 +479,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       ctx.log('task_push', `已派发 · 指令「${text}」`, 'muted')
       // 45s 没等到 Agent 落笔就把状态灯拨回，防止卡死
       ctx.later(45000, () => {
-        if (pendingTask) ctx.patchAgent(meId, 'idle')
+        if (pendingTask) ctx.patchAgent(meId(), 'idle')
       })
     },
     previewResult: (result, previewId) => emit('preview', { result, previewId }),

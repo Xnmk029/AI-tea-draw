@@ -65,6 +65,7 @@ class SteamTransport extends EventEmitter {
   }
   send(target, data) {
     if (!this.room || !this.memberIds().includes(target)) throw new Error('NOT_A_ROOM_MEMBER');
+    if (this.selfId !== this.hostId && target !== this.hostId) throw new Error('INVALID_DIRECTION');
     const bytes = protocol.encode(this.project, this.room.id.toString(), data);
     if (!this.client.networking.sendP2PPacket(BigInt(target), this.client.networking.SendType.Reliable, bytes)) throw new Error('STEAM_SEND_FAILED');
     return bytes.length;

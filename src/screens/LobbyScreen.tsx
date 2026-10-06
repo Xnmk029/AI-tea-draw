@@ -2,6 +2,7 @@ import { useState, type CSSProperties } from 'react'
 import { ArrowLeft, Check, Copy, Crown, Minus, Plus, RotateCcw, Send, UserPlus } from 'lucide-react'
 import type { AgentLevel, GuesserAgent, ModeId, PresetId, RoomRules, Seat } from '../core/types'
 import { AGENT_LEVELS, GUESSER_AGENT, MODES } from '../core/theme'
+import type { NetRoom } from '../game/useNetRoom'
 import { ALLOWED_TAGS, BLOCKED_TAGS, POLICY_PRESETS } from '../core/svgPolicy'
 import { DEFAULT_RULES, MAX_SEATS, ROOM_CODE, TEA_THEME } from '../mock/room'
 import { rollRelayTitle } from '../mock/prompts'
@@ -22,6 +23,7 @@ interface Props {
   onRules: (r: RoomRules) => void
   onBack: () => void
   onStart: () => void
+  room?: NetRoom
 }
 
 const LOBBY_CHAT = [
@@ -51,24 +53,55 @@ const seatPos = (i: number) => {
 
 type RuleTab = 'agent' | 'round' | 'ink'
 
-export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBack, onStart }: Props) {
-  const me = seats.find((s) => s.isMe)!
+export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBack, onStart, room }: Props) {
+  const me = seats.find((s) => s.isMe) ?? seats[0]
   const [chat, setChat] = useState(LOBBY_CHAT)
   const [draft, setDraft] = useState('')
   const [tab, setTab] = useState<RuleTab>('agent')
-  const readyCount = seats.filter((s) => s.ready).length
+
+  // ---------- 联机大厅 ----------
+  // App 常驻会话持有房间连接，大厅只展示房规、成员和聊天。
+  const netMode = !!room?.enabled
+  const link = room?.ready ? room.link : null
+  const netErr = room?.error
+  const netRoom = room?.link?.room
+  const netMembers = room?.seats ?? []
+  const netChat = (room?.chat ?? []).map((m) => ({ text: m.text, name: room?.seats.find((s) => s.id === m.seat)?.name ?? '茶客', color: room?.seats.find((s) => s.id === m.seat)?.color ?? '#8a6a4a' }))
+  const viewSeats = netMode ? netMembers.length ? netMembers : [me] : seats
+  const isHost = !netMode || !!room?.isHost
+  const netQ = netMode ? { name: me.name, room: isHost ? undefined : netRoom } : null
+  const readyCount = viewSeats.filter((s) => s.ready).length
   const set = <K extends keyof RoomRules>(k: K, v: RoomRules[K]) => onRules({ ...rules, [k]: v })
   const ids = Object.keys(MODES) as ModeId[]
-  const shiftMode = (d: number) => onMode(ids[(ids.indexOf(mode) + d + ids.length) % ids.length])
+  /** host 切模式 → 广播给 peer 大厅跟随 */
+  const pickMode = (m: ModeId) => {
+    if (netMode && !isHost) return
+    onMode(m)
+  }
+  const shiftMode = (d: number) => pickMode(ids[(ids.indexOf(mode) + d + ids.length) % ids.length])
   const toggleReady = () => onSeats(seats.map((s) => (s.isMe ? { ...s, ready: !s.ready } : s)))
+  /** host 开局：由常驻会话同步配置与局标识后进入对局 */
+  const start = () => {
+    if (netMode && (!link || !isHost || netErr || mode === 'relay')) return
+    onStart()
+  }
 
   useBack(onBack)
-  useHotkeys({ q: () => shiftMode(-1), e: () => shiftMode(1), ' ': toggleReady, Enter: onStart })
+  useHotkeys({ q: () => shiftMode(-1), e: () => shiftMode(1), ' ': netMode ? () => {} : toggleReady, Enter: start })
 
   const send = () => {
-    if (!draft.trim()) return
-    setChat((c) => [...c, { seat: me.id, text: draft.trim() }])
+    const text = draft.trim()
+    if (!text) return
     setDraft('')
+    if (!netMode) {
+      setChat((c) => [...c, { seat: me.id, text }])
+      return
+    }
+    room?.sendChat(text)
+  }
+
+  const copyRoom = () => {
+    if (netRoom) void navigator.clipboard?.writeText(netRoom)
   }
 
   return (
@@ -85,17 +118,17 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
             <b>{MODES[mode].name}</b>
             <span>{MODES[mode].desc}</span>
             <div className="tt-ready">
-              {seats.map((s) => (
+              {viewSeats.map((s) => (
                 <i key={s.id} className={s.ready ? 'on' : ''} style={{ '--c': s.color } as CSSProperties} />
               ))}
               <em>
-                {readyCount}/{seats.length} 已准备
+                {netMode ? `${netMembers.length} 人已入座` : `${readyCount}/${seats.length} 已准备`}
               </em>
             </div>
           </div>
         </div>
         {Array.from({ length: MAX_SEATS }).map((_, i) => {
-          const s = seats[i]
+          const s = viewSeats[i]
           return (
             <div key={i} className="seat-slot" style={seatPos(i)}>
               {s ? (
@@ -119,8 +152,8 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
           </button>
           <div className="room-plate">
             <span>茶桌</span>
-            <b>#{ROOM_CODE}</b>
-            <button className="icon-btn sm" title="复制房间码">
+            <b>#{netMode ? netRoom ?? '…' : ROOM_CODE}</b>
+            <button className="icon-btn sm" title="复制房间码" onClick={copyRoom}>
               <Copy size={14} />
             </button>
           </div>
@@ -129,7 +162,7 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
         <div className="anchor a-tc mode-switch">
           <Key k="Q" />
           {ids.map((m) => (
-            <button key={m} className={mode === m ? 'on' : ''} onClick={() => onMode(m)}>
+            <button key={m} className={mode === m ? 'on' : ''} disabled={netMode && (!isHost || m === 'relay')} title={netMode && m === 'relay' ? '传话联机尚未开放' : netMode && !isHost ? '跟随房主' : undefined} onClick={() => pickMode(m)}>
               {MODES[m].name}
             </button>
           ))}
@@ -137,22 +170,35 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
         </div>
 
         <div className="anchor a-tr">
-          <button className="gbtn ghost">
+          <button className="gbtn ghost" onClick={copyRoom}>
             <UserPlus size={18} /> 邀请好友
           </button>
         </div>
 
         <div className="anchor a-bl lobby-chat-strip">
           <div className="lcs-list">
-            {chat.slice(-3).map((m, i) => {
-              const s = seats.find((x) => x.id === m.seat)!
-              return (
-                <div key={i} className="lcs-msg">
-                  <b style={{ color: s.color }}>{s.name}</b>
-                  <span>{m.text}</span>
-                </div>
-              )
-            })}
+            {netErr && (
+              <div className="lcs-msg">
+                <b style={{ color: '#b4552f' }}>联机</b>
+                <span>{netErr}</span>
+              </div>
+            )}
+            {netMode
+              ? netChat.slice(-3).map((m, i) => (
+                  <div key={i} className="lcs-msg">
+                    <b style={{ color: m.color }}>{m.name}</b>
+                    <span>{m.text}</span>
+                  </div>
+                ))
+              : chat.slice(-3).map((m, i) => {
+                  const s = seats.find((x) => x.id === m.seat)!
+                  return (
+                    <div key={i} className="lcs-msg">
+                      <b style={{ color: s.color }}>{s.name}</b>
+                      <span>{m.text}</span>
+                    </div>
+                  )
+                })}
           </div>
           <div className="lcs-input">
             <input placeholder="和大家聊两句…" value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} />
@@ -164,17 +210,44 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
 
         <div className="anchor a-br hud-row">
           <div className="me-status">
-            <TeaPet color={me.color} status={me.ready ? 'review' : 'idle'} size={44} />
+            <TeaPet color={me.color} status={netMode ? (link ? 'review' : 'idle') : me.ready ? 'review' : 'idle'} size={44} />
             <span>
-              <b>{me.agent ? `${me.agent.name} 已就位` : '未携带茶宠'}</b>
-              <small>{me.agent ? `${me.agent.model} · ${me.agent.latency}ms` : '纯手绘参战'}</small>
+              {netMode ? (
+                <>
+                  <b>{netQ?.name ?? me.name}{!netQ?.room ? ' · 房主' : ''}</b>
+                  <small>{link ? `${link.transport === 'steam' ? 'Steam' : 'Mock'} 联机 · ${netMembers.length} 人已入座` : netErr ? '联机失败' : '连接联机桥…'}</small>
+                </>
+              ) : (
+                <>
+                  <b>{me.agent ? `${me.agent.name} 已就位` : '未携带茶宠'}</b>
+                  <small>{me.agent ? `${me.agent.model} · ${me.agent.latency}ms` : '纯手绘参战'}</small>
+                </>
+              )}
             </span>
           </div>
-          <button className={`gbtn big ${me.ready ? 'ghost' : ''}`} onClick={toggleReady}>
-            {me.ready ? '取消准备' : '准备'} <Key k="Space" />
-          </button>
-          <button className="gbtn big primary" onClick={onStart}>
-            开始游戏 <em className="gb-sub">{readyCount}/{seats.length}</em> <Key k="Enter" />
+          {!netMode && (
+            <button className={`gbtn big ${me.ready ? 'ghost' : ''}`} onClick={toggleReady}>
+              {me.ready ? '取消准备' : '准备'} <Key k="Space" />
+            </button>
+          )}
+          <button className="gbtn big primary" onClick={netMode && netErr ? room?.retry : start} disabled={netMode && (!link || !isHost || mode === 'relay') && !netErr}>
+            {netMode ? (
+              netErr ? (
+                '重新连接'
+              ) : !link ? (
+                '连接联机桥…'
+              ) : !isHost ? (
+                '等待房主开局…'
+              ) : (
+                <>
+                  开始游戏 <em className="gb-sub">{netMembers.length} 人已入座</em> <Key k="Enter" />
+                </>
+              )
+            ) : (
+              <>
+                开始游戏 <em className="gb-sub">{readyCount}/{viewSeats.length}</em> <Key k="Enter" />
+              </>
+            )}
           </button>
         </div>
       </div>
@@ -185,7 +258,7 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
           <header className="sheet-head row">
             <h2>茶单</h2>
             <p>仅房主可修改</p>
-            <button className="gbtn sm ghost" onClick={() => onRules(DEFAULT_RULES)}>
+            <button className="gbtn sm ghost" disabled={netMode && !isHost} onClick={() => onRules(DEFAULT_RULES)}>
               <RotateCcw size={14} /> 默认
             </button>
           </header>
@@ -200,7 +273,7 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
               笔墨
             </button>
           </div>
-          <div className="sheet-body">
+          <fieldset className="sheet-body" disabled={netMode && !isHost} style={{ border: 0, margin: 0, minWidth: 0 }}>
             {tab === 'agent' && (
               <>
                 <div className="rule">
@@ -260,8 +333,21 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
                 ) : (
                   <div className="rule two">
                     <div>
-                      <div className="rule-label">每回合</div>
-                      <Segmented value={String(rules.roundTime)} onChange={(v) => set('roundTime', +v)} options={['60', '80', '120'].map((v) => ({ value: v, label: `${v}s` }))} />
+                      <div className="rule-label">单轮时间</div>
+                      <div className="stepper number">
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          step={5}
+                          value={rules.roundTime}
+                          onChange={(e) => {
+                            const v = Math.min(300, Math.max(10, Number(e.target.value) || 80))
+                            set('roundTime', v)
+                          }}
+                        />
+                        <span className="unit">秒</span>
+                      </div>
                     </div>
                     <div>
                       <div className="rule-label">轮数</div>
@@ -370,7 +456,7 @@ export function LobbyScreen({ mode, onMode, seats, onSeats, rules, onRules, onBa
                 </div>
               </div>
             )}
-          </div>
+          </fieldset>
         </aside>
       </div>
     </div>

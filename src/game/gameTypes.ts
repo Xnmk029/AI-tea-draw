@@ -4,7 +4,7 @@ import type { Pt, Rect } from '../core/geometry'
 import type { DrawingKey } from '../mock/drawings'
 import type { DrawTarget, TargetMark } from './targeting'
 import type { LivePeer } from './mcpClient'
-import type { NetParams } from './netSync'
+import type { NetLink, NetParams } from './netSync'
 
 export type { DrawTarget, TargetMark } from './targeting'
 export type { LivePeer, LivePeerState } from './mcpClient'
@@ -80,6 +80,7 @@ export interface UseGameOptions {
   guessRole: GuessRole
   /** 联机参数（?net=&token=&room=&name= 深链）；缺省 = 单机模拟 */
   net?: NetParams
+  netLink?: NetLink
 }
 
 /** 一场对局的结算载荷：进结算屏时由 useGame 收集，App 透传给 ResultScreen */
@@ -216,7 +217,7 @@ export interface GameState {
   /** 真实 Agent 桥（teadraw mcp）的连接状态；off/connecting 时走本地模拟 */
   live?: LivePeer
   /** 联机房间状态（netSync）；undefined = 单机 */
-  net?: { role: 'host' | 'peer'; room: string; peers: number }
+  net?: { role: 'host' | 'peer'; room: string; peers: number; error?: string }
   /** peer 端收到 host 的 session-over 载荷（GameScreen 据此跳结算屏） */
   netResult?: SessionResult | null
   /** 结束整局：host 结算+广播并返回载荷；peer 发 end-req 返回 null（结算经 netResult 到达） */

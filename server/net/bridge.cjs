@@ -6,11 +6,12 @@ const { randomBytes, timingSafeEqual, randomInt } = require('node:crypto');
 const { WebSocketServer, WebSocket } = require('ws');
 const { MAX_PACKET_BYTES, validateProject } = require('./protocol.cjs');
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
-async function createBridge({ root, project = 'html-coop', transport, port = 0 } = {}) {
+async function createBridge({ root, project = 'html-coop', transport, port = 0, reconnectGraceMs = 30000 } = {}) {
   root = fs.realpathSync(root);
   validateProject(project);
   const token = randomBytes(32).toString('hex');
   let client = null; let closing = false; let operation = Promise.resolve();let pending=0;
+  let leaveTimer = null; const queuedEvents = []; let queuedBytes = 0;
   const metrics = { received: 0, sent: 0, errors: 0 };
   const server = http.createServer((req, res) => {
     try {
@@ -29,7 +30,7 @@ async function createBridge({ root, project = 'html-coop', transport, port = 0 }
       }
       const type = TYPES[path.extname(file)]; if (!type) throw new Error('PRIVATE_PATH');
       let contents = fs.readFileSync(file);
-      if (path.extname(file) === '.html') contents = Buffer.from(contents.toString().replace('</head>', '<script src="/__steam/client.js"></script></head>'));
+      if (path.extname(file) === '.html' && fs.existsSync(path.resolve(__dirname, '../../adapters/browser/bridge-client.js'))) contents = Buffer.from(contents.toString().replace('</head>', '<script src="/__steam/client.js"></script></head>'));
       res.setHeader('Content-Type', type + (type.startsWith('text/') ? '; charset=utf-8' : ''));
       res.end(contents);
     } catch (_) { res.writeHead(404); res.end('Not found'); }
@@ -51,13 +52,20 @@ async function createBridge({ root, project = 'html-coop', transport, port = 0 }
     if (client && client.readyState === WebSocket.OPEN) { socket.end('HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n'); return; }
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
   });
-  function event(name, result) { if (client?.readyState === WebSocket.OPEN && client.bufferedAmount < 2 * MAX_PACKET_BYTES) client.send(JSON.stringify({ event: name, result })); }
+  function event(name, result) {
+    const value = JSON.stringify({ event: name, result });
+    if (client?.readyState === WebSocket.OPEN && client.bufferedAmount < 2 * MAX_PACKET_BYTES) client.send(value);
+    else if (name === 'packet' && queuedEvents.length < 512 && queuedBytes + Buffer.byteLength(value) < 2 * MAX_PACKET_BYTES) { queuedEvents.push(value); queuedBytes += Buffer.byteLength(value); }
+  }
   transport.on('packet', p => { metrics.received++; event('packet', p); });
   transport.on('members', p => event('members', p));
   transport.on('closed', p => event('closed', p));
   transport.on('fault', p => { metrics.errors++; event('fault', p); });
   wss.on('connection', ws => {
+    clearTimeout(leaveTimer); leaveTimer = null;
     client = ws; event('state', transport.info());
+    for (const value of queuedEvents) ws.send(value);
+    queuedEvents.length = 0; queuedBytes = 0;
     ws.on('error', () => {});
     ws.on('message', bytes => {
       if(++pending>128){pending--;ws.close(1008,'BRIDGE_BACKPRESSURE');return;}
@@ -66,9 +74,9 @@ async function createBridge({ root, project = 'html-coop', transport, port = 0 }
         let request;
         try {
           request = JSON.parse(bytes.toString()); let result;
-          if (request.op === 'create') result = await transport.createRoom();
-          else if (request.op === 'join') result = await transport.joinRoom(request.room);
-          else if (request.op === 'leave') { await transport.leave(); result = transport.info(); }
+          if (request.op === 'create') result = transport.info().room ? transport.info() : await transport.createRoom();
+          else if (request.op === 'join') result = transport.info().room === String(request.room) ? transport.info() : await transport.joinRoom(request.room);
+          else if (request.op === 'leave') { clearTimeout(leaveTimer); leaveTimer = null; queuedEvents.length = 0; queuedBytes = 0; await transport.leave(); result = transport.info(); }
           else if (request.op === 'send') {
             if (!request.data || typeof request.data !== 'object' || Array.isArray(request.data)) throw new Error('INVALID_MESSAGE');
             if (ws.bufferedAmount > 2 * MAX_PACKET_BYTES) throw new Error('BRIDGE_BACKPRESSURE');
@@ -82,7 +90,10 @@ async function createBridge({ root, project = 'html-coop', transport, port = 0 }
     });
     ws.on('close', () => {
       if (client === ws) client = null;
-      if (!closing) operation = operation.then(() => transport.leave()).catch(() => {});
+      if (!closing && !client) leaveTimer = setTimeout(() => {
+        leaveTimer = null;
+        operation = operation.then(async () => { if (!client) { queuedEvents.length = 0; queuedBytes = 0; await transport.leave(); } }).catch(() => {});
+      }, reconnectGraceMs);
     });
   });
   // Some Windows installations allocate low ports for listen(0), including
@@ -99,7 +110,7 @@ async function createBridge({ root, project = 'html-coop', transport, port = 0 }
   }
   const base = `http://127.0.0.1:${server.address().port}`;
   return { base, token, url: `${base}/index.html?steam=1#token=${token}`, transport, metrics,
-    close: async () => { closing = true; for (const ws of wss.clients) ws.terminate(); await operation; await transport.close(); await new Promise(resolve => wss.close(resolve)); await new Promise(resolve => server.close(resolve)); }
+    close: async () => { closing = true; clearTimeout(leaveTimer); queuedEvents.length = 0; for (const ws of wss.clients) ws.terminate(); await operation; await transport.close(); await new Promise(resolve => wss.close(resolve)); await new Promise(resolve => server.close(resolve)); }
   };
 }
 function args(argv) { const out = {}; for (let i = 0; i < argv.length; i += 2) { if (!argv[i].startsWith('--') || !argv[i+1]) throw new Error('INVALID_ARGUMENTS'); out[argv[i].slice(2)] = argv[i+1]; } return out; }

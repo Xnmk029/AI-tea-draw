@@ -707,6 +707,23 @@
 .code-boxes span.cur {
   border-color: var(--seal-a);
 }
+.code-boxes.wide input {
+  position: relative;
+  opacity: 1;
+  width: 100%;
+  min-width: 0;
+  height: 84px;
+  padding: 16px;
+  border: 2px solid rgba(42, 41, 37, 0.12);
+  border-bottom-width: 5px;
+  border-radius: 14px;
+  background: #fff;
+  font-family: var(--mono);
+  font-size: 28px;
+}
+.code-boxes.wide input:focus {
+  border-color: var(--seal-a);
+}
 .friend-rows {
   display: flex;
   flex-direction: column;

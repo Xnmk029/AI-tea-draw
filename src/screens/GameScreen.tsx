@@ -10,12 +10,14 @@ import { AgentBar, GuessBar } from '../game/AgentBar'
 import { SidePanel } from '../game/SidePanel'
 import { RelayWaiting, RoundOver, WordPicker } from '../game/Overlays'
 import { Portal } from '../ui/Shell'
+import type { NetLink } from '../game/netSync'
 
 interface Props {
   mode: ModeId
   seats: Seat[]
   rules: RoomRules
   guessRole: GuessRole
+  netLink?: NetLink
   onExit: () => void
   /** 结束时把本局结算载荷带出去 */
   onFinish: (r: SessionResult) => void
@@ -29,7 +31,7 @@ interface Props {
  *   l-panel  宾客侧栏
  *   舞台级   modal（选词、等待、回合结束） / toast
  */
-export function GameScreen({ mode, seats, rules, guessRole, onExit, onFinish }: Props) {
+export function GameScreen({ mode, seats, rules, guessRole, netLink, onExit, onFinish }: Props) {
   // 联机深链：?net=<bridge端口>&token=<token>[&room=<房间码>][&name=<名字>]
   const net = useMemo(() => {
     const q = new URLSearchParams(location.search)
@@ -44,7 +46,7 @@ export function GameScreen({ mode, seats, rules, guessRole, onExit, onFinish }: 
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-  const g = useGame({ mode, seats, rules, guessRole, net })
+  const g = useGame({ mode, seats, rules, guessRole, net, netLink })
   const [sideOpen, setSideOpen] = useState(true)
   const finish = () => {
     const r = g.requestFinish()
