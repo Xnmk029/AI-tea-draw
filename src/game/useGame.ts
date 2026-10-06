@@ -136,6 +136,10 @@ export function useGame(opts: UseGameOptions): GameState {
   /** host 侧：peerId → 座位 id / 名字 */
   const peerSeats = useRef(new Map<string, number>(hostSave?.peers ?? []))
   const peerNames = useRef(new Map<string, string>(hostSave?.peerNames ?? []))
+  const helloRequest = useRef('')
+  const handledHello = useRef(new Map<string, string>())
+  const rosterSignature = useRef('')
+  const finishedResult = useRef<SessionResult | null>(null)
   /** host 广播来的结算载荷（peer 端据此跳结算屏） */
   const [netResult, setNetResult] = useState<SessionResult | null>(null)
   /** 本轮计时终点（host 发 endsAt 时间戳；peer 据此本地倒计时） */
@@ -551,7 +555,7 @@ export function useGame(opts: UseGameOptions): GameState {
     }
   }, [mode, rules])
 
-  /** 结束整局：host 结算+广播 session-over 返回载荷；peer 发 end-req 等广播（返回 null 由 netResult 兜） */
+  /** 结束整局：host 只广播一次完整结果；peer 等 session-over 注水。 */
   const requestFinish = useCallback((): SessionResult | null => {
     const net = netRef.current
     if (netUnavailable.current) return null
@@ -559,7 +563,9 @@ export function useGame(opts: UseGameOptions): GameState {
       showToast('等待房主结束对局')
       return null
     }
+    if (finishedResult.current) return finishedResult.current
     const r = collectResult()
+    finishedResult.current = r
     net?.broadcast({ t: 'session-over', result: r })
     return r
   }, [collectResult, showToast])
@@ -922,6 +928,9 @@ export function useGame(opts: UseGameOptions): GameState {
     const net = netRef.current
     if (!net || net.role !== 'host') return
     const roster = rosterList()
+    const signature = JSON.stringify(roster.map(({ id, name, color, online, isHost }) => ({ id, name, color, online, isHost: !!isHost })))
+    if (signature === rosterSignature.current) return
+    rosterSignature.current = signature
     S.current.seats = roster
     setSeats(roster)
     net.broadcast({ t: 'roster', seats: roster.map((s) => ({ id: s.id, name: s.name, color: s.color, score: s.score, online: s.online, isHost: !!s.isHost })) })
@@ -969,7 +978,10 @@ export function useGame(opts: UseGameOptions): GameState {
       if (msg.t !== 'hello' && !peerSeats.current.has(from)) return
       switch (msg.t) {
         case 'hello': {
-          // 幂等：peer 大厅→对局重连会重发 hello，已分过座位就补发 seat-assign+roster+snapshot
+          // 挂载与 game-ready 可以重发同一请求，只定向补一次完整快照。
+          const requestId = typeof msg.requestId === 'string' && msg.requestId.length <= 80 ? msg.requestId : undefined
+          if (requestId && handledHello.current.get(from) === requestId) return
+          if (requestId) handledHello.current.set(from, requestId)
           let sid = peerSeats.current.get(from)
           if (sid == null) {
             const rosterSeat = net.seatRoster?.find((s) => s.peerId === from)?.seat
@@ -1129,7 +1141,7 @@ export function useGame(opts: UseGameOptions): GameState {
     (msg: RoomMsg) => {
       switch (msg.t) {
         case 'game-ready':
-          netRef.current?.intent({ t: 'hello', name: netParams?.name ?? init.seats.find((s) => s.isMe)?.name ?? '茶客' })
+          netRef.current?.intent({ t: 'hello', requestId: helloRequest.current, name: netParams?.name ?? init.seats.find((s) => s.isMe)?.name ?? '茶客' })
           break
         case 'seat-assign':
           if (!Number.isInteger(msg.seat) || Number(msg.seat) < 1 || Number(msg.seat) > 8) return
@@ -1314,6 +1326,7 @@ export function useGame(opts: UseGameOptions): GameState {
       for (const p of gone) {
         peerSeats.current.delete(p)
         peerNames.current.delete(p)
+        handledHello.current.delete(p)
       }
       setForeignMarks((ms) => ms.filter((m) => !goneSeats.has(m.seat)))
       pushRoster()
@@ -1356,7 +1369,10 @@ export function useGame(opts: UseGameOptions): GameState {
       },
       onError: (reason) => {
         if (dead) return
-        if (reason === 'GAME_SYNC_REQUIRED' && netRef.current?.role === 'peer') netRef.current.intent({ t: 'hello', name: netParams?.name ?? me.name })
+        if (reason === 'GAME_SYNC_REQUIRED' && netRef.current?.role === 'peer') {
+          helloRequest.current = crypto.randomUUID()
+          netRef.current.intent({ t: 'hello', requestId: helloRequest.current, name: netParams?.name ?? me.name })
+        }
         else showToast(`联机消息未送达：${reason}`)
       },
     }
@@ -1372,12 +1388,13 @@ export function useGame(opts: UseGameOptions): GameState {
           else if (l.role === 'host') { peerSeats.current.set(entry.peerId, entry.seat); peerNames.current.set(entry.peerId, entry.name) }
         }
         setNetView({ role: l.role, room: l.room, peers: l.members().length })
+        helloRequest.current = crypto.randomUUID()
         unsubscribe = l.subscribe(hooks, 'game')
         if (l.role === 'host') {
           if (!offeredWords.current.length) offeredWords.current = S.current.wordOptions
           pushRoster()
           l.broadcast({ t: 'game-ready' })
-        } else l.intent({ t: 'hello', name: netParams?.name ?? init.seats.find((s) => s.isMe)?.name ?? '茶客' })
+        } else l.intent({ t: 'hello', requestId: helloRequest.current, name: netParams?.name ?? init.seats.find((s) => s.isMe)?.name ?? '茶客' })
         say({ seat: null, author: 'system', text: `联机房间 #${l.room} 已${l.role === 'host' ? '创建' : '加入'}（${l.transport}）` })
     }
     if (opts.netLink) attach(opts.netLink)

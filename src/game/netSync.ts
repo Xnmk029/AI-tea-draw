@@ -120,17 +120,28 @@ export async function connectNet(params: NetParams, hooks: NetHooks): Promise<Ne
   }
   const role: NetLink['role'] = info.hostId === info.selfId ? 'host' : 'peer'
 
-  const send = (to: string, msg: RoomMsg) => {
-    if (stopped) return
+  const send = (recipients: string[], msg: RoomMsg) => {
+    if (stopped || !recipients.length) return
     const payload = gameplay(msg) ? { ...msg, gameId: link!.gameId } : msg
     sending = sending.then(async () => {
       if (stopped) return
       const body = JSON.stringify(payload)
       if (body.length > 16 * 1024 * 1024) throw new Error('GAME_PACKET_TOO_LARGE')
-      if (body.length <= 48000) { await client.send(to, payload); return }
-      const id = crypto.randomUUID()
-      const total = Math.ceil(body.length / 48000)
-      for (let index = 0; index < total && !stopped; index++) await client.send(to, { t: 'session-chunk', id, index, total, chunk: body.slice(index * 48000, (index + 1) * 48000) })
+      // 同次广播只编码、分片一次；收件人仍逐个有序发送，沿用客户端背压。
+      let packets = [body]
+      if (body.length > 48000) {
+        const id = crypto.randomUUID()
+        const total = Math.ceil(body.length / 48000)
+        packets = Array.from({ length: total }, (_, index) => JSON.stringify({ t: 'session-chunk', id, index, total, chunk: body.slice(index * 48000, (index + 1) * 48000) }))
+      }
+      for (const to of recipients) {
+        try {
+          for (const packet of packets) {
+            if (stopped) return
+            await client.sendSerialized(to, packet)
+          }
+        } catch (e) { error(e) } // 某成员离房不阻断其余成员的落笔/结算。
+      }
     }).catch(error)
   }
   link = {
@@ -159,13 +170,9 @@ export async function connectNet(params: NetParams, hooks: NetHooks): Promise<Ne
       }
       return () => { listeners.delete(listener) }
     },
-    intent: (msg) => send(link!.hostId, msg),
-    broadcast: (msg) => {
-      for (const m of client.state?.members ?? []) {
-        if (m !== link!.selfId) send(m, msg)
-      }
-    },
-    to: send,
+    intent: (msg) => send([link!.hostId], msg),
+    broadcast: (msg) => send((client.state?.members ?? []).filter((m) => m !== link!.selfId), msg),
+    to: (to, msg) => send([to], msg),
     members: () => client.state?.members ?? [],
     close: () => {
       stopped = true
@@ -176,6 +183,6 @@ export async function connectNet(params: NetParams, hooks: NetHooks): Promise<Ne
     disconnect: () => { stopped = true; listeners.clear(); clearChunks(); return client.close() },
   }
 
-  if (role === 'peer') link.intent({ t: 'hello', name: params.name ?? '茶客' })
+  // 大厅与游戏订阅者各自握手；连接层不提前请求尚未挂载的完整游戏快照。
   return link
 }

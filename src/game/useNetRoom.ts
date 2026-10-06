@@ -71,14 +71,18 @@ export function useNetRoom(options: {
     l.seatRoster = state.current.members
     setMembers(state.current.members)
     persist()
-    const msg = { t: 'lobby-state', ...state.current }
+    // 日常房间状态只携带配置和名单，完整画布结果保留在本地存档。
+    const { result: _result, ...metadata } = state.current
+    const msg = { t: 'lobby-state', ...metadata }
     if (to) l.to(to, msg)
     else l.broadcast(msg)
   }
   const apply = (msg: RoomMsg) => {
     const l = linkRef.current
     if (!l || (msg.mode !== 'tea' && msg.mode !== 'guess') || !msg.rules || typeof msg.rules !== 'object' || !Array.isArray(msg.members) || typeof msg.gameId !== 'string' || !['lobby', 'game', 'result'].includes(String(msg.phase))) return
-    state.current = msg as unknown as RoomState
+    const incoming = msg as unknown as RoomState
+    const result = incoming.result ?? (incoming.gameId === state.current.gameId ? state.current.result : null)
+    state.current = { ...incoming, result }
     l.seatRoster = state.current.members
     l.setGame(state.current.gameId)
     latest.current.onMode(state.current.mode)
@@ -88,7 +92,8 @@ export function useNetRoom(options: {
     setError(null)
     window.clearInterval(helloTimer.current)
     persist()
-    latest.current.onPhase(state.current.phase, state.current.gameId, state.current.result)
+    // 新加入结算页先等定向结果，避免显示演示数据或上一局的相册。
+    if (state.current.phase !== 'result' || result) latest.current.onPhase(state.current.phase, state.current.gameId, result)
   }
   const packet = (from: string, msg: RoomMsg) => {
     const l = linkRef.current
@@ -106,8 +111,12 @@ export function useNetRoom(options: {
     }
     if (!l.members().includes(from)) return
     if (msg.t === 'hello' || msg.t === 'lobby-hello') {
-      state.current.members = roster().map((m) => m.peerId === from ? { ...m, name: typeof msg.name === 'string' ? msg.name.trim().slice(0, 12) || '茶客' : m.name } : m)
-      publish()
+      const members = roster().map((m) => m.peerId === from ? { ...m, name: typeof msg.name === 'string' ? msg.name.trim().slice(0, 12) || '茶客' : m.name } : m)
+      const changed = JSON.stringify(members) !== JSON.stringify(state.current.members)
+      state.current.members = members
+      if (changed) publish()
+      else if (msg.t === 'lobby-hello') publish(from)
+      if (state.current.phase === 'result' && state.current.result) l.to(from, { t: 'session-over', result: state.current.result })
     }
     if (msg.t === 'lobby-chat' && typeof msg.text === 'string') {
       const member = state.current.members.find((m) => m.peerId === from)
@@ -125,8 +134,11 @@ export function useNetRoom(options: {
     setChat((c) => [...c.slice(-49), msg])
     l.broadcast({ t: 'lobby-chat', msg })
   }
-  const callbacks = useRef({ packet, publish })
-  callbacks.current = { packet, publish }
+  const refreshMembers = () => {
+    if (JSON.stringify(roster()) !== JSON.stringify(state.current.members)) publish()
+  }
+  const callbacks = useRef({ packet, publish, refreshMembers })
+  callbacks.current = { packet, publish, refreshMembers }
 
   useEffect(() => {
     if (!params || !active) return
@@ -136,7 +148,7 @@ export function useNetRoom(options: {
     const previous = joining.current
     const pending = previous.then(() => dead ? undefined : connectNet({ ...params, room: target.current }, {
       onPacket: (from, msg) => { if (!dead) callbacks.current.packet(from, msg) },
-      onMembers: () => { if (!dead) callbacks.current.publish() },
+      onMembers: () => { if (!dead) callbacks.current.refreshMembers() },
       onClose: (reason) => {
         if (dead || closed.current) return
         setError(reason === 'HOST_LEFT' ? '房主已离开，房间已结束' : `联机连接中断：${reason}`)

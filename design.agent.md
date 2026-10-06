@@ -211,12 +211,15 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
   - `OpNode` memo：draft 拖动不再整树重渲全部笔迹
   - InkWash/InkBake 平移缩放都用 CSS transform 假跟随 + 240ms 防抖重烘焙，避免每帧重算水彩/位图
 - **验收已过**：手画线与 Agent 素材同渲染、mask 揭幕逐笔、洇散底衬可见；tsc/build 通过，笔迹层独立 chunk（78KB 按需加载）
+- **2026-10-06 性能与墨晕对齐修复**：轮廓以不可变 `SvgEl` + seed 的 WeakMap 缓存，元素/轮廓的 Path2D 复用，超过 900 笔不再全清；1200 笔本机重复查找约 0.6–0.7ms（Node CPU 基准，不代表浏览器帧率）。InkBake/InkWash 只在 ops/相机/隐藏座位变化时同步，待落定动画每笔只登记一个计时器，相机/尺寸重建保留原截止时间；位图上报与水彩 render 每帧合并一次。
+- `p5.brush/standalone` 默认以画布中心为原点；墨晕抵消半幅原点后再应用 `(world-cam)*zoom`，stageScale 只影响像素密度，修复右下墨印偏移。回归：`tools/brush-parser-test.mjs`、`tools/brush-cache-test.mjs`、`tools/ink-layers-test.mjs`、`tools/ink-layers-visual-test.mjs`。
 
 ### T3 联网（Host 权威）
 - 大厅/对局/结算由 App 的 `useNetRoom` 常驻会话连接，UI 卸载只取消订阅；`netSync` 区分 session/game 通道，gameId 隔离新局，round 校验旧轮，`game-ready→hello→snapshot` 处理切屏期间补水。
 - 茶绘与猜词已接大厅完整玩法/房规/座位同步，Host 统一校验人/Agent 操作并保留 author/笔速动画。传话联机明确禁用，真实 Steam 双账号仍需验收。
 - 桥断 socket 保留身份 30 秒，主动 leave 立即离房；Host 按 room+gameId 同步保存 sessionStorage 核心状态供刷新恢复，peer 向 Host 请求快照。断线显示错误并阻止本地分裂，不静默回退单机。
 - 验证入口：`node server/test-net-lifecycle.mjs`、`node server/test-net-client.mjs`、`node tools/net-lobby-e2e.mjs`；后一项从真实首页菜单开始，覆盖人/Agent双向绘图、刷新、猜词轮换、结算与再开，输出 `test-output/net-regression/`（忽略提交）。
+- 联机流量：连接层不抢先 hello；同一请求只定向补一次游戏快照，名单不变不重复广播 roster，大厅状态不携带整份结算画布。结算结果广播一次，迟到/刷新玩家定向补结果；同次广播只编码/分片一次，个别玩家发送失败不阻断其他玩家。`server/test-net-traffic.mjs` 与 `tools/net-traffic-test.mjs` 验证次数、字节和结算恢复。
 - Op 广播格式：`{t:'ops',gameId,round,ops:Op[]}`，删除为 `{t:'op-del',gameId,ids}`。Host 编号、校验、计算墨量及 Agent 动画后广播，详见 `design.net.md`。
 - 中途加入：`hello → seat-assign/roster/snapshot` 注水后继续接收增量；尚无独立持久化增量日志或 Host 迁移。
 - 网络层复用团队已有的 Steam P2P（SpaceWar）组件。

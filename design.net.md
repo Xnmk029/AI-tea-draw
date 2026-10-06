@@ -49,6 +49,8 @@ node server/teadraw-net.mjs ping --port 5191              # 测活
 node server/test-net.mjs <tokA> <tokB>                    # 双桥冒烟
 node server/test-net-lifecycle.mjs                        # 隔离生命周期回归
 node server/test-net-client.mjs                           # TS 客户端重连、大包分块与局隔离回归
+node server/test-net-traffic.mjs                          # 广播编码复用与成员故障隔离
+node tools/net-traffic-test.mjs                           # 三端握手/结算去重与字节统计
 node tools/net-lobby-e2e.mjs                              # 完整菜单双端回归；可用 NET_TEST_URL 换 Vite 地址
 # 浏览器: http://localhost:5180/?net=<port>&token=<tok>  （桥启动时打印完整深链）
 ```
@@ -63,7 +65,7 @@ node tools/net-lobby-e2e.mjs                              # 完整菜单双端�
 |---|---|---|
 | `lobby-hello` | `{name}` | 同步真实名字与完整 `lobby-state` |
 | `lobby-chat` | `{text}` | 按发送者座位盖章，再广播 `lobby-chat{msg}` |
-| `hello` | `{name}` | 复用大厅座位 → `seat-assign` + `roster` + `snapshot` |
+| `hello` | `{name,requestId?}` | 同一请求去重，复用大厅座位 → 定向 `seat-assign` + `roster` + `snapshot`；名单变化才全员 roster |
 | `op` / `ops` | `{el, tf?, author?, round}` / `{items:[{el,tf?,author?}], round}` | 当前画手/回合 + SVG 白名单 + 元素/几何上限 + Agent 墨量 → `ops`；失败定向 `op-rejected` |
 | `op-erase` | `{id, round}` | 当前回合可作画且 op.seat === 发者 seat → `op-del` |
 | `mark` | `{mark:TargetMark, round}` | 当前回合可作画、公开标记、目标几何与数量合法 → `mark` |
@@ -78,7 +80,7 @@ node tools/net-lobby-e2e.mjs                              # 完整菜单双端�
 
 | t | 载荷 | 说明 |
 |---|---|---|
-| `lobby-state` | `{mode,rules,phase,gameId,members,result?}` | 完整房间状态；新成员与重连立即补发 |
+| `lobby-state` | `{mode,rules,phase,gameId,members}` | 房间配置和名单；不夹带完整结果，新成员与重连立即定向补发 |
 | `lobby-chat` | `{msg}` | 常驻大厅聊天 |
 | `game-ready` | `{}` | Host 对局挂载完成，Peer 重发 `hello` 补快照 |
 | `seat-assign` | `{seat, color}` | 定向：告诉新员自己的座位 |
@@ -129,7 +131,9 @@ node tools/net-lobby-e2e.mjs                              # 完整菜单双端�
 - **联机时本地模拟自动关闭**（各端各跑 sim 会分裂画面）；bot 填充座位是 P4 的活
 - P2+P4a 已做茶绘/你画我猜；relay 联机在入口明确禁用，等待 P4b 全量协议。
 - 联机时 `readOnly`/`role` 不再来自 URL `?role=` prop，而是按 `drawerSeat` 动态推导（host 首轮恒为画手，成员座位 ≥2）
-- 大厅 `lobby-state` 包含 mode/rules/phase/gameId/members/result；新员加入立即补发，只有房主改房规和开局。座位 peerId→seat 在大厅与对局共用 `NetLink.seatRoster`；peer 的悄悄提示（whisper）联机下禁用。
+- 大厅 `lobby-state` 包含 mode/rules/phase/gameId/members；新员加入立即补发，只有房主改房规和开局。座位 peerId→seat 在大厅与对局共用 `NetLink.seatRoster`；peer 的悄悄提示（whisper）联机下禁用。
+- 完整结算 `session-over` 仅广播一次；结果在 Host 本地保留，同局迟到/刷新玩家定向获取，Peer 在收到结果前不进入空演示相册。相同游戏 requestId 只补一次快照，成员/名字未变时不广播名单。同次广播 JSON 编码/分片复用，各成员失败独立处理。
+- 流量回归：三桥编码/故障隔离 3 项、三浏览器握手/结算恢复 11 项通过；测试样本的重复握手应用 JSON 发送量 18,130→2,874 字节，结算 6,309→3,441 字节。旧值按同样载荷与原行为推算，新值是实际 UTF-8 JSON 字节，不含 WS/Steam 包头，不代表真实 Steam 带宽压缩率。
 - 浏览器刷新/短暂断 socket 时本机桥保留成员身份 30 秒；同房 join/create 幂等。`NetLink.close()` 显式 leave，`disconnect()` 只断 socket。房主快照按 room+gameId 存入 sessionStorage，含画布/回合/词卡/画手/计时/比分；客机刷新从房主注水。存储容量耗尽、超过宽限期或关闭桥进程不保证恢复。
 - 游戏包携带 gameId，绘图/擦除/标记携带 round，旧局/旧轮请求被拒绝。切屏期间 game 通道缓存消息，`game-ready→hello→snapshot` 补齐挂载时序；大包以 session-chunk 分块，顺序发送并限制重组/缓存大小。
 - 中枢或房主离开后明确显示联机中断，不静默变成单机。结算回大厅/再开由房主同步驱动，客机不能本地切玩法或重开。

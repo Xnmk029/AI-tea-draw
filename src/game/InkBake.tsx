@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { Op } from '../core/types'
 import type { Camera } from './gameTypes'
-import { brushOutline, elToPath2D } from '../brush/stroke'
+import { brushOutline, elToPath2D, outlineToPath2D } from '../brush/stroke'
 import { stageScale } from '../ui/stage'
 
 interface Props {
@@ -17,12 +17,17 @@ interface BakeState {
   canvases: Record<'human' | 'agent', HTMLCanvasElement | null>
   ctxs: Record<'human' | 'agent', CanvasRenderingContext2D | null>
   drawn: Set<string>
-  timers: number[]
+  pending: Map<string, number>
+  /** 动画第一次出现时的绝对落定时刻，相机/尺寸变化不能重新延迟。 */
+  deadlines: Map<string, number>
   camKey: string
+  followKey: string
   bakedCam: Camera | null
   camDebounce: number
   flush: boolean
   lastReported: Set<string>
+  reportFrame: number
+  active: boolean
   sync: (() => void) | null
   rebuild: (() => void) | null
 }
@@ -41,8 +46,8 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
   const st = useRef<BakeState>({
     canvases: { human: null, agent: null },
     ctxs: { human: null, agent: null },
-    drawn: new Set(), timers: [], camKey: '', bakedCam: null, camDebounce: 0, flush: false,
-    lastReported: new Set(), sync: null, rebuild: null,
+    drawn: new Set(), pending: new Map(), deadlines: new Map(), camKey: '', followKey: '', bakedCam: null, camDebounce: 0, flush: false,
+    lastReported: new Set(), reportFrame: 0, active: false, sync: null, rebuild: null,
   })
   const latest = useRef({ ops, cam, hiddenSeats, onBaked })
   latest.current = { ops, cam, hiddenSeats, onBaked }
@@ -71,12 +76,7 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
       if (out) {
         ctx.fillStyle = String(a.stroke)
         ctx.globalAlpha = num(a.strokeOpacity ?? a['stroke-opacity'] ?? 1) * opacity
-        const p = new Path2D()
-        const pts = out.pts
-        p.moveTo(pts[0][0], pts[0][1])
-        for (let i = 1; i < pts.length; i++) p.lineTo(pts[i][0], pts[i][1])
-        p.closePath()
-        ctx.fill(p)
+        ctx.fill(outlineToPath2D(out))
       } else if (!hasFill) {
         // 非笔墨化描边（虚线指引等）：原样栅格
         const sw = num(a.strokeWidth ?? a['stroke-width'])
@@ -94,31 +94,81 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
     }
   }
 
-  /** 落定一笔：画进位图 + 上报 baked 集合 */
+  /** 同一帧落定多笔只复制/上报一次集合，避免每笔触发父组件重渲染。 */
+  const report = () => {
+    const s = st.current
+    if (!s.active || s.reportFrame) return
+    s.reportFrame = requestAnimationFrame(() => {
+      s.reportFrame = 0
+      if (!s.active || (s.drawn.size === s.lastReported.size && [...s.drawn].every((id) => s.lastReported.has(id)))) return
+      const cur = new Set(s.drawn)
+      s.lastReported = cur
+      latest.current.onBaked(cur)
+    })
+  }
+
+  /** 落定一笔：画进位图，下一帧合并上报。 */
   const settle = (op: Op) => {
     const s = st.current
     if (s.drawn.has(op.id)) return
     const ctx = s.ctxs[op.author === 'agent' ? 'agent' : 'human']
-    if (ctx) drawOp(ctx, op)
+    if (!ctx || !s.active) return
+    drawOp(ctx, op)
     s.drawn.add(op.id)
     report()
   }
 
-  const report = () => {
+  const cancelPending = () => {
     const s = st.current
-    const cur = new Set(s.drawn)
-    if (cur.size === s.lastReported.size && [...cur].every((id) => s.lastReported.has(id))) return
-    s.lastReported = cur
-    latest.current.onBaked(cur)
+    for (const timer of s.pending.values()) clearTimeout(timer)
+    s.pending.clear()
+  }
+
+  const visibleOps = () => {
+    const s = st.current
+    const { ops, hiddenSeats } = latest.current
+    const present = new Set(ops.map((op) => op.id))
+    for (const id of s.deadlines.keys()) if (!present.has(id)) s.deadlines.delete(id)
+    const now = performance.now()
+    for (const op of ops) {
+      if (!op.anim) {
+        s.deadlines.delete(op.id)
+        const pending = s.pending.get(op.id)
+        if (pending != null) { clearTimeout(pending); s.pending.delete(op.id) }
+      }
+      if (op.anim && !s.deadlines.has(op.id)) s.deadlines.set(op.id, now + op.anim.delay + op.anim.dur + 90)
+    }
+    const visible = ops.filter((op) => !hiddenSeats.has(op.seat))
+    const ids = new Set(visible.map((op) => op.id))
+    for (const [id, timer] of s.pending) {
+      if (!ids.has(id)) {
+        clearTimeout(timer)
+        s.pending.delete(id)
+      }
+    }
+    return visible
+  }
+
+  const enqueue = (op: Op) => {
+    const s = st.current
+    if (s.drawn.has(op.id) || s.pending.has(op.id)) return
+    const remaining = (s.deadlines.get(op.id) ?? 0) - performance.now()
+    if (remaining <= 0) settle(op)
+    else s.pending.set(op.id, window.setTimeout(() => {
+      s.pending.delete(op.id)
+      const current = latest.current.ops.find((o) => o.id === op.id)
+      if (current && !latest.current.hiddenSeats.has(current.seat)) settle(current)
+    }, remaining))
   }
 
   const rebuild = () => {
     const s = st.current
-    const { ops, cam, hiddenSeats } = latest.current
-    s.timers.forEach(clearTimeout)
-    s.timers = []
+    const { cam } = latest.current
+    cancelPending()
+    clearTimeout(s.camDebounce)
+    s.camDebounce = 0
     s.drawn.clear()
-    s.camKey = `${cam.x.toFixed(2)}|${cam.y.toFixed(2)}|${cam.z}`
+    s.camKey = s.followKey = `${cam.x}|${cam.y}|${cam.z}`
     s.bakedCam = { ...cam }
     for (const k of ['human', 'agent'] as const) {
       const cv = s.canvases[k]
@@ -129,11 +179,7 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
         ctx.clearRect(0, 0, cv.width / density(), cv.height / density())
       }
     }
-    const visible = ops.filter((o) => !hiddenSeats.has(o.seat))
-    for (const op of visible) {
-      if (op.anim) s.timers.push(window.setTimeout(() => settle(op), op.anim.delay + op.anim.dur + 90))
-      else settle(op)
-    }
+    for (const op of visibleOps()) enqueue(op)
     s.flush = false
     report()
   }
@@ -141,7 +187,8 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
   const followCam = (cam: Camera) => {
     const s = st.current
     const b = s.bakedCam
-    if (b && (b.x !== cam.x || b.y !== cam.y || b.z !== cam.z)) {
+    s.followKey = `${cam.x}|${cam.y}|${cam.z}`
+    if (b) {
       const zr = cam.z / b.z
       for (const k of ['human', 'agent'] as const) {
         const cv = s.canvases[k]
@@ -152,32 +199,25 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
       }
     }
     clearTimeout(s.camDebounce)
-    s.camDebounce = window.setTimeout(() => rebuild(), 240)
+    s.camDebounce = s.followKey === s.camKey ? 0 : window.setTimeout(() => rebuild(), 240)
   }
 
   const sync = () => {
     const s = st.current
-    const { ops, cam, hiddenSeats } = latest.current
-    const key = `${cam.x.toFixed(2)}|${cam.y.toFixed(2)}|${cam.z}`
-    const visible = ops.filter((o) => !hiddenSeats.has(o.seat))
+    const { cam } = latest.current
+    const key = `${cam.x}|${cam.y}|${cam.z}`
+    const visible = visibleOps()
     const ids = new Set(visible.map((o) => o.id))
     if (!s.camKey) {
       rebuild()
-      return
-    }
-    if (key !== s.camKey) {
-      followCam(cam)
       return
     }
     if (s.flush || [...s.drawn].some((id) => !ids.has(id)) || visible.length < s.drawn.size) {
       rebuild()
       return
     }
-    for (const op of visible) {
-      if (s.drawn.has(op.id)) continue
-      if (op.anim) s.timers.push(window.setTimeout(() => settle(op), op.anim.delay + op.anim.dur + 90))
-      else settle(op)
-    }
+    if (key !== s.followKey) followCam(cam)
+    for (const op of visible) enqueue(op)
   }
   st.current.sync = sync
   st.current.rebuild = rebuild
@@ -186,7 +226,9 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
     const host = hostRef.current
     if (!host) return
     const s = st.current
+    s.active = true
     const make = () => {
+      cancelPending()
       const w = Math.max(1, host.clientWidth)
       const h = Math.max(1, host.clientHeight)
       for (const k of ['human', 'agent'] as const) {
@@ -215,9 +257,16 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
     ro.observe(host)
     return () => {
       ro.disconnect()
-      s.timers.forEach(clearTimeout)
+      s.active = false
+      cancelPending()
+      s.deadlines.clear()
+      clearTimeout(s.camDebounce)
+      cancelAnimationFrame(s.reportFrame)
+      s.reportFrame = 0
       s.canvases.human?.remove()
       s.canvases.agent?.remove()
+      s.canvases = { human: null, agent: null }
+      s.ctxs = { human: null, agent: null }
       s.sync = null
       s.rebuild = null
     }
@@ -226,7 +275,7 @@ export function InkBake({ ops, cam, hiddenSeats, onBaked }: Props) {
 
   useEffect(() => {
     st.current.sync?.()
-  })
+  }, [ops, cam, hiddenSeats])
 
   return <div ref={hostRef} className="inkbake" aria-hidden />
 }

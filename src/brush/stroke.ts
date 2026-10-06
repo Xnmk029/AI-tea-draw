@@ -41,8 +41,9 @@ function fastPts(el: SvgEl): { pts: Pt[]; closed: boolean } | null {
   }
   if (el.tag === 'path') {
     const d = String(a.d ?? '')
-    const toks = d.match(/[A-Za-z]|-?\d*\.?\d+(?:e[-+]?\d+)?/gi)
-    if (!toks || toks.length < 3) return null
+    const tokenRe = /[A-Za-z]|[+-]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/gi
+    const toks = d.match(tokenRe)
+    if (!toks || toks.length < 3 || d.replace(tokenRe, '').replace(/[\s,]/g, '') || !/^[Mm]$/.test(toks[0])) return null
     const pts: Pt[] = []
     let cur: Pt = { x: 0, y: 0 }
     let closed = false
@@ -50,20 +51,28 @@ function fastPts(el: SvgEl): { pts: Pt[]; closed: boolean } | null {
     let cmd = ''
     const isCmd = (t: string) => /^[A-Za-z]$/.test(t)
     const next = () => Number(toks[i++])
+    const hasNumbers = (n: number) => i + n <= toks.length && toks.slice(i, i + n).every((t) => !isCmd(t) && Number.isFinite(Number(t)))
     while (i < toks.length) {
       if (isCmd(toks[i])) {
         cmd = toks[i++]
         if (!'MLQZmlqz'.includes(cmd)) return null // 其它命令回退 DOM 采样
       }
       if (cmd === 'M' || cmd === 'm') {
-        cur = { x: next(), y: next() }
+        // 多子路径交给 DOM，避免把两段不相连的中心线接成一笔。
+        if (pts.length || !hasNumbers(2)) return null
+        const x = next(), y = next()
+        cur = { x: x + (cmd === 'm' ? cur.x : 0), y: y + (cmd === 'm' ? cur.y : 0) }
         pts.push(cur)
         cmd = cmd === 'M' ? 'L' : 'l'
       } else if (cmd === 'L' || cmd === 'l') {
-        cur = { x: next(), y: next() }
+        if (!hasNumbers(2)) return null
+        const x = next(), y = next()
+        cur = { x: x + (cmd === 'l' ? cur.x : 0), y: y + (cmd === 'l' ? cur.y : 0) }
         pts.push(cur)
       } else if (cmd === 'Q' || cmd === 'q') {
-        const cx = next(), cy = next(), ex = next(), ey = next()
+        if (!hasNumbers(4)) return null
+        const dx = cmd === 'q' ? cur.x : 0, dy = cmd === 'q' ? cur.y : 0
+        const cx = next() + dx, cy = next() + dy, ex = next() + dx, ey = next() + dy
         // 二次贝塞尔按弧长近似细分（人画曲线平滑且密，8 段足够）
         for (let k = 1; k <= 8; k++) {
           const t = k / 8
@@ -73,7 +82,9 @@ function fastPts(el: SvgEl): { pts: Pt[]; closed: boolean } | null {
         cur = { x: ex, y: ey }
       } else if (cmd === 'Z' || cmd === 'z') {
         closed = true
-      }
+        // 关闭后不再允许隐式坐标；尾随数据或其它子路径回退 DOM。
+        if (i < toks.length) return null
+      } else return null
     }
     return pts.length >= 2 ? { pts, closed } : null
   }
@@ -167,7 +178,9 @@ export interface StrokeOut {
   pts: number[][]
 }
 
-const strokeCache = new Map<string, StrokeOut | null>()
+const strokeCache = new WeakMap<SvgEl, Map<string | number, StrokeOut | null>>()
+const pathCache = new WeakMap<SvgEl, Path2D>()
+const outlinePathCache = new WeakMap<StrokeOut, Path2D>()
 
 /**
  * 描边元素 → 笔墨轮廓。
@@ -175,13 +188,12 @@ const strokeCache = new Map<string, StrokeOut | null>()
  */
 export function brushOutline(el: SvgEl, seed: string | number): StrokeOut | null {
   if (!brushable(el)) return null
+  let cache = strokeCache.get(el)
+  if (cache?.has(seed)) return cache.get(seed)!
+  if (!cache) { cache = new Map(); strokeCache.set(el, cache) }
   const press = parsePP(el)
-  const key = JSON.stringify([el.tag, el.attrs, seed, !!press])
-  const hit = strokeCache.get(key)
-  if (hit !== undefined) return hit
   const out = build(el, typeof seed === 'number' ? seed : hashSeed(seed), press)
-  if (strokeCache.size > 900) strokeCache.clear()
-  strokeCache.set(key, out)
+  cache.set(seed, out)
   return out
 }
 
@@ -229,6 +241,24 @@ function build(el: SvgEl, seed: number, press: number[] | null): StrokeOut | nul
 
 /** 元素 → Canvas Path2D（InkBake 烘焙层用；虚线/填充形状直接栅格化） */
 export function elToPath2D(el: SvgEl): Path2D {
+  let cached = pathCache.get(el)
+  if (!cached) { cached = buildPath2D(el); pathCache.set(el, cached) }
+  return cached
+}
+
+export function outlineToPath2D(out: StrokeOut): Path2D {
+  let cached = outlinePathCache.get(out)
+  if (!cached) {
+    cached = new Path2D()
+    cached.moveTo(out.pts[0][0], out.pts[0][1])
+    for (let i = 1; i < out.pts.length; i++) cached.lineTo(out.pts[i][0], out.pts[i][1])
+    cached.closePath()
+    outlinePathCache.set(out, cached)
+  }
+  return cached
+}
+
+function buildPath2D(el: SvgEl): Path2D {
   const a = el.attrs
   if (el.tag === 'path') return new Path2D(String(a.d ?? ''))
   const p = new Path2D()

@@ -87,7 +87,7 @@ export class NetClient {
     return this.connecting
   }
 
-  private async request<T = unknown>(op: string, payload: Record<string, unknown> = {}): Promise<T> {
+  private async request<T = unknown>(op: string, payload: Record<string, unknown> = {}, serializedData?: string): Promise<T> {
     await this.connect()
     if (this.pending.size >= 128 || (this.ws && this.ws.bufferedAmount > 1572864)) throw new Error('BRIDGE_BACKPRESSURE')
     return new Promise<T>((resolve, reject) => {
@@ -95,7 +95,9 @@ export class NetClient {
       const timer = window.setTimeout(() => { this.pending.delete(id); reject(new Error('BRIDGE_REQUEST_TIMEOUT')) }, 10000)
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer })
       try {
-        this.ws!.send(JSON.stringify({ id, op, ...payload }))
+        // NetSync 已编码的广播数据可在各收件人之间复用，只重建请求头。
+        const header = JSON.stringify({ id, op, ...payload })
+        this.ws!.send(serializedData === undefined ? header : `${header.slice(0, -1)},"data":${serializedData}}`)
       } catch (e) {
         this.pending.delete(id)
         window.clearTimeout(timer)
@@ -107,6 +109,8 @@ export class NetClient {
   createRoom() { return this.request<NetInfo>('create').then((s) => (this.state = s)) }
   joinRoom(room: string) { return this.request<NetInfo>('join', { room }).then((s) => (this.state = s)) }
   send(to: string, data: Record<string, unknown>) { return this.request('send', { to, data }) }
+  /** 仅供 NetSync 复用已校验并序列化的 JSON 数据。 */
+  sendSerialized(to: string, data: string) { return this.request('send', { to }, data) }
   leave() { return this.request<NetInfo>('leave').then((s) => (this.state = s)) }
 
   close(): Promise<void> {
