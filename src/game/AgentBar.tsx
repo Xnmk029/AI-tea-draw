@@ -25,7 +25,14 @@ const MARK_META: Record<string, { icon: ReactNode; label: string }> = {
 /** 底部茶宠 + 吩咐气泡：人与自己 Agent 的唯一交互入口；茶宠可以直接拖到画布上插令旗 */
 export function AgentBar({ g }: { g: GameState }) {
   const agent = g.me.agent
-  const [text, setText] = useState('')
+  // 主页「我的茶宠」里选的预设提示词：进对局自动带出到吩咐栏（一次性消费）
+  const [text, setText] = useState(() => {
+    try {
+      const p = localStorage.getItem('teadraw.presetPrompt')
+      if (p) localStorage.removeItem('teadraw.presetPrompt')
+      return p ?? ''
+    } catch { return '' }
+  })
   const [focused, setFocused] = useState(false)
   const [showLog, setShowLog] = useState(false)
   const [dragPet, setDragPet] = useState<{ x: number; y: number } | null>(null)

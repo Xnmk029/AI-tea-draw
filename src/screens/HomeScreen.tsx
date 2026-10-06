@@ -1,8 +1,8 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
-import { ArrowRight, Copy, Terminal, Users } from 'lucide-react'
-import type { AgentStatus, ModeId } from '../core/types'
+import { lazy, Suspense, useState, type CSSProperties, type ReactNode } from 'react'
+import { ArrowRight, Users } from 'lucide-react'
+import type { ModeId } from '../core/types'
 import { MODES } from '../core/theme'
-import { FRIENDS, INITIAL_SEATS, ROOM_CODE } from '../mock/room'
+import { FRIENDS, INITIAL_SEATS } from '../mock/room'
 import type { SceneItem } from '../mock/drawings'
 import { Avatar } from '../components/Avatar'
 import { AgentGlyph } from '../components/AgentGlyph'
@@ -11,6 +11,10 @@ import { SceneThumb } from '../components/SceneThumb'
 import { AgentTip, HumanTip } from '../components/CursorTips'
 import { TeaPet } from '../game/TeaPet'
 import { Key, useBack, useHotkeys } from '../ui/Shell'
+import { useAgentSession } from '../agent/AgentSession'
+import type { PetSandbox } from '../agent/petTypes'
+
+const PetWorkbench = lazy(() => import('../agent/PetWorkbench').then(module => ({ default: module.PetWorkbench })))
 
 interface Props {
   mode: ModeId
@@ -18,6 +22,7 @@ interface Props {
   onEnter: () => void
   /** 联机会话下输入房间码真实进房（未接 net 时为 undefined，回退 Demo 行为） */
   onJoin?: (code: string) => void
+  pet: PetSandbox
 }
 
 type PanelId = 'play' | 'join' | 'pet' | 'gallery' | 'settings' | 'quit'
@@ -39,10 +44,11 @@ const BG_SCENE: SceneItem[] = [
   { key: 'sun', x: 300, y: 0, s: 0.5 },
 ]
 
-export function HomeScreen({ mode, onMode, onEnter, onJoin }: Props) {
+export function HomeScreen({ mode, onMode, onEnter, onJoin, pet }: Props) {
   const [focus, setFocus] = useState(0)
   const [panel, setPanel] = useState<PanelId | null>(null)
   const me = INITIAL_SEATS[0]
+  const session = useAgentSession()
 
   const open = (i: number) => {
     const item = MENU[i]
@@ -65,10 +71,10 @@ export function HomeScreen({ mode, onMode, onEnter, onJoin }: Props) {
     s: () => move(1),
     Enter: () => (panel === 'play' ? onEnter() : open(focus)),
     ...Object.fromEntries(MENU.map((_, i) => [String(i + 1), () => open(i)])),
-  })
+  }, panel !== 'pet')
 
   return (
-    <div className={`scr scr-home ${panel ? 'has-panel' : ''}`}>
+    <div className={`scr scr-home ${panel ? 'has-panel' : ''} ${panel === 'pet' ? 'has-pet' : ''}`}>
       {/* L0 背景：大幅场景 */}
       <div className="l-bg">
         <div className="home-scene">
@@ -119,12 +125,12 @@ export function HomeScreen({ mode, onMode, onEnter, onJoin }: Props) {
 
         <div className="anchor a-tr home-tr">
           <button className="hud-chip" onClick={() => setPanel('pet')}>
-            <TeaPet color={me.color} status="idle" size={30} />
+            <TeaPet color={me.color} status={session?.connected ? pet.status : 'offline'} size={30} />
             <span>
-              <b>{me.agent?.name}</b>
-              <small>茶宠已唤醒</small>
+              <b>{session?.peer.name ?? '我的茶宠'}</b>
+              <small>{session?.connected ? '真实 Agent 已连接' : session?.peer.state === 'ready' ? '桥已连接 · 等待 Agent' : '尚未连接'}</small>
             </span>
-            <i className="conn-dot" />
+            <i className={`conn-dot ${session?.connected ? '' : 'pet-off'}`} />
           </button>
           <div className="hud-chip">
             <Avatar seat={me} size={30} badge={false} />
@@ -166,10 +172,10 @@ export function HomeScreen({ mode, onMode, onEnter, onJoin }: Props) {
       {/* L4 面板：右侧滑出的纸页 */}
       <div className="l-panel">
         {panel && (
-          <section key={panel} className="sheet home-sheet">
+          <section key={panel} className={`sheet home-sheet ${panel === 'pet' ? 'pet-sheet' : ''}`}>
             {panel === 'play' && <PlayPanel mode={mode} onMode={onMode} onEnter={onEnter} />}
             {panel === 'join' && <JoinPanel onEnter={onEnter} onJoin={onJoin} />}
-            {panel === 'pet' && <PetPanel />}
+            {panel === 'pet' && <Suspense fallback={<SheetBody title="我的茶宠" sub="茶宠工作台加载中…"><span>正在铺开试画纸</span></SheetBody>}><PetWorkbench pet={pet} /></Suspense>}
             {panel === 'settings' && <SettingsPanel />}
             {panel === 'quit' && (
               <SheetBody title="离开茶馆" sub="茶还热着呢，真的要走吗？">
@@ -294,55 +300,6 @@ function JoinPanel({ onEnter, onJoin }: { onEnter: () => void; onJoin?: (code: s
           ))}
         </div>
       )}
-    </SheetBody>
-  )
-}
-
-function PetPanel() {
-  const agent = INITIAL_SEATS[0].agent!
-  const [status, setStatus] = useState<AgentStatus>('idle')
-  const [test, setTest] = useState(0)
-  useEffect(() => {
-    if (!test) return
-    setStatus('thinking')
-    const a = window.setTimeout(() => setStatus('drawing'), 900)
-    const b = window.setTimeout(() => setStatus('idle'), 3200)
-    return () => {
-      window.clearTimeout(a)
-      window.clearTimeout(b)
-    }
-  }, [test])
-  return (
-    <SheetBody title="我的茶宠" sub="你的 Agent 通过 CLI + MCP 附身在茶宠身上">
-      <div className="pet-stage">
-        <TeaPet color={INITIAL_SEATS[0].color} status={status} size={150} />
-        <div className="pet-test">{test > 0 ? <SceneThumb key={test} items={[{ key: 'sun', x: 50, y: 0, s: 0.5 }]} viewBox="0 0 200 100" animate={160} /> : <span>让茶宠在这里画一笔，检查链路</span>}</div>
-      </div>
-      <dl className="kv-rows">
-        <dt>附身 Agent</dt>
-        <dd>
-          <AgentGlyph size={14} color="var(--accent)" /> {agent.name} · {agent.model}
-        </dd>
-        <dt>连接</dt>
-        <dd>stdio · teadraw-mcp</dd>
-        <dt>延迟</dt>
-        <dd>{agent.latency} ms</dd>
-        <dt>可用工具</dt>
-        <dd>9 个 · canvas / turn / chat</dd>
-      </dl>
-      <div className="cli-line">
-        <Terminal size={15} />
-        <code>teadraw agent attach --room {ROOM_CODE}</code>
-        <button className="icon-btn sm" title="复制">
-          <Copy size={13} />
-        </button>
-      </div>
-      <div className="sheet-actions">
-        <button className="gbtn ghost">断开</button>
-        <button className="gbtn primary" onClick={() => setTest((n) => n + 1)}>
-          测试画一笔
-        </button>
-      </div>
     </SheetBody>
   )
 }

@@ -11,6 +11,8 @@ import { DemoNav } from './components/DemoNav'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { Curtain, LayerRoots, Portal } from './ui/Shell'
 import { netParams, savedNetRoom, useNetRoom } from './game/useNetRoom'
+import { useAgentSession } from './agent/AgentSession'
+import { usePetSandbox } from './agent/usePetSandbox'
 
 // Demo 深链：?screen=game&mode=guess&role=guesser
 const q = new URLSearchParams(location.search)
@@ -21,6 +23,8 @@ const savedRoom = savedNetRoom(params)
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>((q.get('screen') as Screen) || 'home')
+  const agentSession = useAgentSession()
+  const pet = usePetSandbox(agentSession, screen === 'home')
   const [mode, setMode] = useState<ModeId>(savedRoom?.mode || (q.get('mode') as ModeId) || 'tea')
   const [rules, setRules] = useState<RoomRules>(savedRoom?.rules || DEFAULT_RULES)
   const [seats, setSeats] = useState<Seat[]>(INITIAL_SEATS)
@@ -93,7 +97,7 @@ export default function App() {
     <div className="stage-outer">
       <div className="stage" style={{ transform: `translate(-50%, -50%) scale(${scale})` }} data-screen={screen}>
         <ErrorBoundary>
-        {screen === 'home' && <HomeScreen mode={mode} onMode={setMode} onEnter={enter} onJoin={netSession ? joinNet : undefined} />}
+        {screen === 'home' && <HomeScreen mode={mode} onMode={setMode} onEnter={enter} onJoin={netSession ? joinNet : undefined} pet={pet} />}
         {screen === 'lobby' && (
           <LobbyScreen
             mode={mode}

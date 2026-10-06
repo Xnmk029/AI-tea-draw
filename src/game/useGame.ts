@@ -22,6 +22,8 @@ import { agentPenKey, simRoundStart, startSimulation, type SimCtx } from './simu
 import { attachLiveAgent, type LiveCtx, type LiveHandle } from './liveAgent'
 import type { LivePeer } from './mcpClient'
 import { connectNet, type NetHooks, type NetLink, type RoomMsg } from './netSync'
+import { useAgentSession } from '../agent/AgentSession'
+import { buildAgentPrompt, readAgentPreferences } from '../agent/preferences'
 
 const SIDEBAR = 324
 const ORIGIN: Transform = { x: 0, y: 0, s: 1 }
@@ -87,6 +89,9 @@ function initialChat(mode: ModeId, role: GuessRole, rules: RoomRules, seats: Sea
 const hasKeyword = (text: string) => Object.values(DRAWINGS).some((d) => d.keywords.some((w) => text.includes(w)))
 
 export function useGame(opts: UseGameOptions): GameState {
+  const agentSession = useAgentSession()
+  const agentSessionRef = useRef(agentSession)
+  agentSessionRef.current = agentSession
   const init = useRef(opts).current
   const { mode, rules } = init
   const roleProp = init.guessRole
@@ -701,7 +706,8 @@ export function useGame(opts: UseGameOptions): GameState {
     if (mode === 'guess' && !L.word) return showToast('先选一个词')
     if (mode === 'relay' && L.submitted) return showToast('已经提交，等待其他人')
     if (mode === 'relay' && !relayTurn) return showToast('当前没有待作画的题目')
-    const liveOn = L.live?.state === 'ready' || L.live?.state === 'awake'
+    const liveOn = L.live?.state === 'awake'
+    if (agentSessionRef.current && !liveOn) return showToast('请先在“我的茶宠”连接并唤醒真实 Agent')
     // 真实链路下：草稿待审时仍阻塞；Agent 思考中的旧任务允许被新指令覆盖
     if (L.ghost || (!liveOn && (busy.current || self.agent.status !== 'idle'))) return
 
@@ -945,6 +951,11 @@ export function useGame(opts: UseGameOptions): GameState {
 
   /** peer：按 host roster 重建座位表（自己的座位标 isMe + 保留本地茶宠） */
   const applyRoster = useCallback((list: { id: number; name: string; color: string; score?: number; online?: boolean; isHost?: boolean }[]) => {
+    const currentAgent = S.current.seats.find(s => s.id === netSeatRef.current)?.agent ?? init.seats.find(s => s.isMe)?.agent
+    const peer = S.current.live ?? agentSessionRef.current?.peer
+    const agent = peer?.state === 'awake'
+      ? { name: peer.name ?? 'Agent', model: peer.model ?? 'unknown', status: currentAgent?.status === 'offline' ? 'idle' as const : currentAgent?.status ?? 'idle' as const, latency: currentAgent?.latency ?? 0 }
+      : currentAgent ? { ...currentAgent, status: 'offline' as const } : null
     const roster = list.map((s) => ({
         id: s.id,
         name: s.name,
@@ -954,7 +965,7 @@ export function useGame(opts: UseGameOptions): GameState {
         score: s.score ?? 0,
         isMe: s.id === netSeatRef.current,
         isHost: s.isHost,
-        agent: s.id === netSeatRef.current ? (init.seats.find((x) => x.isMe)?.agent ?? null) : null,
+        agent: s.id === netSeatRef.current ? agent : null,
       }))
     S.current.seats = roster
     setSeats(roster)
@@ -1627,8 +1638,24 @@ export function useGame(opts: UseGameOptions): GameState {
       room: () => netRef.current?.room ?? ROOM_CODE,
       submitGuess: (text) => localActions.current.submitGuess(text, 'agent'),
       sendChat: (text) => localActions.current.sendChat(text, 'agent'),
+      context: 'game',
+      profilePrompt: () => buildAgentPrompt('').replace(/^本次题目：\s*\n/, ''),
+      preservePosition: () => readAgentPreferences().composition !== 'center',
     }
-    liveRef.current = attachLiveAgent(liveCtx, setLive)
+    const onPeer = (peer: LivePeer) => {
+      S.current.live = peer
+      setLive(peer)
+      const mine = netSeatRef.current ?? meId
+      setSeats(current => current.map(seat => seat.id !== mine ? seat : {
+        ...seat,
+        agent: peer.state === 'awake'
+          ? { name: peer.name ?? 'Agent', model: peer.model ?? 'unknown', status: seat.agent?.status === 'offline' ? 'idle' : seat.agent?.status ?? 'idle', latency: seat.agent?.latency ?? 0 }
+          : seat.agent ? { ...seat.agent, status: 'offline' } : null,
+      }))
+    }
+    liveRef.current = agentSessionRef.current
+      ? agentSessionRef.current.bind(`game:${netRef.current?.room ?? 'local'}:${netRef.current?.gameId ?? uid('session')}`, liveCtx, onPeer)
+      : attachLiveAgent(liveCtx, onPeer)
 
     if (mode !== 'tea') {
       every(1000, () => {

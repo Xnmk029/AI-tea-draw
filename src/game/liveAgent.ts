@@ -15,8 +15,6 @@ import {
 import { agentPenKey } from './simulation'
 import { McpClient, type CallResult, type LivePeer } from './mcpClient'
 
-const MCP_PORT = new URLSearchParams(location.search).get('mcp') ?? '5190'
-const WS_URL = `ws://127.0.0.1:${MCP_PORT}`
 const PATH_SLOT = 210
 
 // ---------- useGame 提供给处理器的上下文 ----------
@@ -67,6 +65,23 @@ export interface LiveCtx {
   room?: () => string
   submitGuess?: (text: string) => void
   sendChat?: (text: string) => void
+  context?: 'sandbox' | 'game'
+  profilePrompt?: () => string
+  preservePosition?: () => boolean
+  onTaskStatus?: (event: LiveTaskStatus) => void
+}
+
+export type LiveTaskStage = 'queued' | 'claimed' | 'preview' | 'drawing' | 'completed' | 'cancelled' | 'failed'
+export interface LiveTaskStatus {
+  taskId: string
+  contextId: string
+  text: string
+  stage: LiveTaskStage
+  at: number
+  detail?: string
+  previewId?: string
+  opIds?: string[]
+  ink?: number
 }
 
 interface LiveEvent {
@@ -78,12 +93,17 @@ interface LiveEvent {
 interface PendingTask {
   id: string
   text: string
+  stage: LiveTaskStage
+  profilePrompt: string
+  preservePosition: boolean
 }
 
 export interface LiveHandle {
   client: McpClient
   /** 玩家吩咐 Agent（askAgent 的真实链路）：把任务挂上，等 Agent 拉取 */
-  pushTask: (text: string) => void
+  pushTask: (text: string) => string
+  cancelTask: (reason?: string) => void
+  completeTask: (taskId?: string) => void
   /** 草稿被玩家盖章/揉掉 → 通知 Agent */
   previewResult: (result: 'accepted' | 'rejected', previewId?: string) => void
   /** 新增笔迹广播给 Agent（events_poll 的 'ops' 事件）：人画的、别人画的、Agent 自己落定的都算 */
@@ -106,8 +126,22 @@ const elSvg = (el: SvgEl) =>
     .map(([k, v]) => `${KEBAB[k] ?? k.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())}="${String(v).replace(/"/g, '&quot;')}"`)
     .join(' ')}/>`
 
-export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): LiveHandle {
+export interface AgentRuntime extends LiveHandle {
+  contextId: string
+  call: (name: string, args: Record<string, unknown>) => Promise<CallResult>
+  join: () => Record<string, unknown>
+  failTask: (reason: string) => void
+}
+
+interface RuntimeOptions {
+  contextId: string
+  isCurrent?: () => boolean
+  emit?: (type: string, data?: unknown) => void
+}
+
+export function createAgentRuntime(ctx: LiveCtx, client: McpClient, options: RuntimeOptions): AgentRuntime {
   const { mode, rules } = ctx
+  const contextId = options.contextId
   const meId = () => ctx.meId
   const myKey = () => agentPenKey(meId())
   const readOnly = () => mode === 'guess' && ctx.role === 'guesser'
@@ -119,11 +153,73 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
     const ev = { seq: ++seq, type, data }
     events.push(ev)
     if (events.length > 120) events.shift()
-    client.event({ type, data })
+    if (options.emit) options.emit(type, data)
+    else client.event({ type, data })
   }
 
   let pendingTask: PendingTask | null = null
+  let disposed = false
+  let taskTimer: ReturnType<typeof setTimeout> | null = null
+  let completionTimer: ReturnType<typeof setTimeout> | null = null
+  let previewTaskId: string | null = null
+  let ownedPreviewId: string | null = null
+  let ownedPreviewBatch: Batch | null = null
+  let pendingCommit: { taskId: string; batch: Batch } | null = null
+  let frameEpoch = 0
+  let activeRound = ctx.state().round
+  const current = () => !disposed && (options.isCurrent?.() ?? true)
+  const clearTaskTimer = () => { if (taskTimer) clearTimeout(taskTimer); taskTimer = null }
+  const clearCompletion = () => { if (completionTimer) clearTimeout(completionTimer); completionTimer = null }
+  const taskStatus = (stage: LiveTaskStage, extra: Partial<LiveTaskStatus> = {}) => {
+    if (!pendingTask) return
+    pendingTask.stage = stage
+    const event: LiveTaskStatus = { taskId: pendingTask.id, contextId, text: pendingTask.text, stage, at: Date.now(), ...extra }
+    ctx.onTaskStatus?.(event)
+    emit('task_status', event)
+  }
+  const cancelTask = (reason = '任务已取消', stage: 'cancelled' | 'failed' = 'cancelled') => {
+    const hadTask = !!pendingTask
+    clearTaskTimer()
+    clearCompletion()
+    frameEpoch++
+    spaceCache.clear()
+    pendingCommit = null
+    if (pendingTask) taskStatus(stage, { detail: reason })
+    pendingTask = null
+    previewTaskId = null
+    if (ownedPreviewId && ctx.state().ghost?.previewId === ownedPreviewId) ctx.setGhost(null)
+    ownedPreviewId = null
+    ownedPreviewBatch = null
+    ctx.think(myKey(), null)
+    ctx.patchAgent(meId(), 'idle')
+    if (stage === 'failed' && hadTask) { ctx.log('task_failed', reason, 'warn'); ctx.showToast(reason) }
+  }
+  const completeTask = (taskId?: string) => {
+    if (!current() || !pendingTask || (taskId && pendingTask.id !== taskId)) return
+    clearTaskTimer()
+    clearCompletion()
+    pendingCommit = null
+    taskStatus('completed')
+    frameEpoch++
+    spaceCache.clear()
+    pendingTask = null
+    previewTaskId = null
+    ownedPreviewId = null
+    ownedPreviewBatch = null
+    ctx.patchAgent(meId(), 'idle')
+  }
+  const awaitDrawing = (batch: Batch, opIds: string[] | null) => {
+    if (!pendingTask) return
+    const taskId = pendingTask.id
+    clearTaskTimer()
+    taskStatus('drawing', { opIds: opIds ?? [], ink: batch.ops.reduce((ink, op) => ink + op.ink, 0) })
+    if (opIds === null) {
+      pendingCommit = { taskId, batch }
+      taskTimer = setTimeout(() => { if (current() && pendingTask?.id === taskId) cancelTask('房主未确认落笔，任务已取消', 'failed') }, 45000)
+    } else completionTimer = setTimeout(() => completeTask(taskId), batch.duration + 80)
+  }
   const spaceCache = new Map<string, { frame: Rect; expires: number }>()
+  const framePrefix = () => `${contextId}/${activeRound}/${frameEpoch}/`
 
   // ---------- 帧：标记 → 供 Agent 引用的矩形 ----------
   const frames = (): { id: string; kind: string; frame: Rect }[] => {
@@ -131,9 +227,9 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
     for (const m of ctx.state().marks) {
       const t = m.target
       if (t.kind === 'path') {
-        out.push({ id: m.id, kind: 'path', frame: targetRect(t) })
-        pathSlots(t.points, PATH_SLOT, 4).forEach((r, i) => out.push({ id: `${m.id}/s${i}`, kind: 'slot', frame: r }))
-      } else out.push({ id: m.id, kind: t.kind, frame: targetRect(t) })
+        out.push({ id: `${framePrefix()}${m.id}`, kind: 'path', frame: targetRect(t) })
+        pathSlots(t.points, PATH_SLOT, 4).forEach((r, i) => out.push({ id: `${framePrefix()}${m.id}/s${i}`, kind: 'slot', frame: r }))
+      } else out.push({ id: `${framePrefix()}${m.id}`, kind: t.kind, frame: targetRect(t) })
     }
     return out
   }
@@ -185,12 +281,17 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
   const handlers: Record<string, (a: any) => Promise<CallResult> | CallResult> = {
     turn_get_task: () => {
       ctx.log('turn_get_task', pendingTask ? `领取任务「${pendingTask.text}」` : '无任务')
-      if (!pendingTask) return ok({ task: null })
+      if (!pendingTask || (pendingTask.stage !== 'queued' && pendingTask.stage !== 'claimed')) return ok({ task: null, contextId })
+      if (pendingTask.stage === 'queued') taskStatus('claimed')
       const L = ctx.state()
       return ok({
         task: {
           id: pendingTask.id,
+          taskId: pendingTask.id,
+          contextId,
+          context: ctx.context ?? 'game',
           text: pendingTask.text,
+          profilePrompt: pendingTask.profilePrompt,
           mode,
           theme: mode === 'tea' ? rules.theme || TEA_THEME : undefined,
           prompt: mode === 'relay' ? ctx.relayTitle : undefined,
@@ -198,7 +299,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
           word: mode === 'guess' && ctx.role === 'drawer' ? L.word?.word : undefined,
           targets: ctx.state().marks.length,
           ink: { used: L.ink.agent, allowance: Math.round(L.ink.allowance), remaining: Math.max(0, Math.round(L.ink.allowance - L.ink.agent)) },
-          rules: { penSpeed: rules.penSpeed, inkRatio: rules.inkRatio, targetFit: rules.targetFit, svgPreset: rules.svgPreset, maxMarks: MAX_MARKS },
+          rules: { penSpeed: rules.penSpeed, inkRatio: rules.inkRatio, targetFit: rules.targetFit, svgPreset: rules.svgPreset, maxMarks: MAX_MARKS, preservePosition: pendingTask.preservePosition, contextId, taskId: pendingTask.id, note: '所有修改工具带 contextId 和 taskId；canvas_draw 可兼容引用本次返回的 targetId/spaceId。preservePosition=true 且内容完全位于指定帧局部范围时保留原留白。风格要求服从房规与 SVG 白名单。' },
         },
       })
     },
@@ -207,6 +308,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       const t = frames()
       ctx.log('canvas_get_targets', t.length ? `${t.length} 个帧` : '无标记')
       return ok({
+        contextId, taskId: pendingTask?.id,
         targets: t.map((f) => ({ id: f.id, kind: f.kind, frame: f.frame })),
         note: '你的 SVG 画在 frame 的局部坐标 0..w × 0..h；提交时带 targetId',
       })
@@ -222,10 +324,10 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       const bound = ctx.frame ?? (L.ops.length ? occ.bound : { x: -760, y: -460, w: 1520, h: 920 })
       const spot = findSpace(occ, w, h, near ?? { x: view.x + view.w / 2, y: view.y + view.h / 2 }, bound)
       if (!spot) return err('找不到这么大的空位')
-      const id = `sp-${uid('x')}`
+      const id = `${framePrefix()}sp-${uid('x')}`
       spaceCache.set(id, { frame: spot, expires: Date.now() + 60000 })
       ctx.log('canvas_find_space', `${Math.round(spot.w)}×${Math.round(spot.h)} @ (${Math.round(spot.x)}, ${Math.round(spot.y)})`)
-      return ok({ space: { id, frame: spot } })
+      return ok({ contextId, taskId: pendingTask?.id, space: { id, frame: spot } })
     },
 
     canvas_snapshot: async (a) => {
@@ -263,7 +365,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       if (mode === 'guess' && !L.word) return err('本轮画手还未选词')
       if (L.roundOver) return err('本轮已结束')
       if (mode === 'relay' && L.submitted) return err('画作已提交')
-      if (L.ghost) return err('还有一张草稿待确认（等玩家盖章或揉掉）', 'preview_pending')
+      if (L.ghost || ownedPreviewId) return err('还有一张草稿待确认（等玩家盖章或揉掉）', 'preview_pending')
 
       const report = sanitizeSvg(String(a?.svg ?? ''), POLICY_PRESETS[rules.svgPreset])
       if (!report.elements.length) {
@@ -280,7 +382,7 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       let picked: { frame: Rect; markIds: string[] }[] = []
       if (ref) {
         const space = spaceCache.get(ref)
-        const markId = ref.split('/')[0]
+        const markId = ref.startsWith(framePrefix()) ? ref.slice(framePrefix().length).split('/')[0] : ref
         // repeat：只取引路目标的槽位帧；槽位不存在时退回整体帧
         const hits = a?.repeat ? all.filter((f) => f.id.startsWith(`${ref}/`)) : all.filter((f) => f.id === ref)
         if (space && space.expires > Date.now()) picked = [{ frame: space.frame, markIds: [] }]
@@ -301,9 +403,14 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       // 局部坐标 → 世界：内容居中放进帧；越界按 fit 策略
       const placements: { els: SvgEl[]; tf: Transform }[] = []
       const usedIds = new Set<string>()
+      const keepLocalPosition = !!ref && (pendingTask?.preservePosition ?? ctx.preservePosition?.() ?? false)
       for (const p of picked) {
         let area = p.frame
-        if (!a?.repeat && rules.avoidOthers !== false && occOverlap(occ, area) > 0) area = nudgeFree(occ, area)
+        if (!keepLocalPosition && !a?.repeat && rules.avoidOthers !== false && occOverlap(occ, area) > 0) {
+          const nudged = nudgeFree(occ, area)
+          const bound = ctx.frame
+          if (!bound || (nudged.x >= bound.x && nudged.y >= bound.y && nudged.x + nudged.w <= bound.x + bound.w && nudged.y + nudged.h <= bound.y + bound.h)) area = nudged
+        }
         const cw = Math.max(content.w, 1)
         const ch = Math.max(content.h, 1)
         let s = 1
@@ -311,9 +418,11 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
           if (fit === 'strict') return err(`内容 ${Math.ceil(cw)}×${Math.ceil(ch)} 超出帧 ${Math.ceil(area.w)}×${Math.ceil(area.h)}（strict 拒绝）`, 'overflow')
           if (fit === 'contain') s = Math.min(area.w / cw, area.h / ch) * 0.92
         }
+        const preservePosition = keepLocalPosition
+          && content.x >= 0 && content.y >= 0 && content.x + content.w <= area.w && content.y + content.h <= area.h
         placements.push({
           els: report.elements,
-          tf: { x: area.x + (area.w - cw * s) / 2 - content.x * s, y: area.y + (area.h - ch * s) / 2 - content.y * s, s },
+          tf: preservePosition ? { x: area.x, y: area.y, s: 1 } : { x: area.x + (area.w - cw * s) / 2 - content.x * s, y: area.y + (area.h - ch * s) / 2 - content.y * s, s },
         })
         p.markIds.forEach((id) => usedIds.add(id))
       }
@@ -332,7 +441,6 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
 
       const wantsCommit = a?.mode === 'commit' && rules.agentLevel !== 'assist'
       const taskText = pendingTask?.text
-      pendingTask = null
       ctx.markUsed([...usedIds])
       ctx.log('canvas_draw', `${previewOps.length} 个元素 · ${wantsCommit ? 'commit' : 'preview'}${taskText ? ` · 任务「${taskText}」` : ''}`)
 
@@ -348,16 +456,23 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
 
       if (!wantsCommit) {
         const previewId = uid('pv')
+        clearTaskTimer()
+        previewTaskId = pendingTask?.id ?? null
+        ownedPreviewId = previewId
+        ownedPreviewBatch = animateOps(previewOps, rules.penSpeed)
         ctx.patchAgent(meId(), 'review')
         ctx.setGhost({ ops: previewOps, label: taskText ?? 'Agent 稿件', ink: inkNeed, notes, previewId })
         emit('preview', { result: 'set', previewId, ink: inkNeed })
+        taskStatus('preview', { previewId, ink: inkNeed })
         return ok({ previewId, ink: inkNeed, removed: report.removed, stripped: report.stripped, note: '等玩家盖章（Tab）或揉掉（Esc），用 events_poll 等结果' })
       }
 
       ctx.patchAgent(meId(), 'drawing')
       ctx.log('canvas_commit', `墨量 ${inkNeed}`, 'ok')
-      const opIds = ctx.commitOps(animateOps(previewOps, rules.penSpeed))
-      if (opIds?.length === 0) return err('落笔被房规拒绝', 'commit_rejected')
+      const batch = animateOps(previewOps, rules.penSpeed)
+      const opIds = ctx.commitOps(batch)
+      if (opIds?.length === 0) { cancelTask('落笔被房规拒绝', 'failed'); return err('落笔被房规拒绝', 'commit_rejected') }
+      awaitDrawing(batch, opIds)
       emit('commit', { ink: inkNeed, opIds, pending: opIds === null })
       return ok({ opIds: opIds ?? [], pending: opIds === null, ink: inkNeed, removed: report.removed, stripped: report.stripped })
     },
@@ -434,6 +549,8 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
       const L = ctx.state()
       ctx.log('room_state', `${mode} · ${ctx.state().seats.filter((s) => s.online).length} 人在线`)
       return ok({
+        context: ctx.context ?? 'game',
+        contextId,
         room: ctx.room?.() ?? ROOM_CODE,
         mode,
         role: ctx.role,
@@ -448,47 +565,104 @@ export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): Li
 
   // 猜词方：悄悄提示每轮一条（live 路径沿用 whisper ×0.5 的计分语义）
   let whisperRound = 0
-  let activeRound = ctx.state().round
-
-  const client = new McpClient({
-    url: WS_URL,
-    join: () => ({ room: ctx.room?.() ?? ROOM_CODE, seat: meId(), me: { name: ctx.state().seats.find((s) => s.id === meId())?.name } }),
-    onPeer,
-    onCall: async (name, args) => {
+  const call: AgentRuntime['call'] = async (name, args) => {
+      if (!current()) return err('作画环境已切换，请重新领取任务', 'stale_context')
       if (activeRound !== ctx.state().round) {
         activeRound = ctx.state().round
-        pendingTask = null
+        cancelTask('回合已切换')
         spaceCache.clear()
       }
+      const mutating = ['canvas_draw', 'canvas_commit', 'chat_send', 'guess_submit', 'hint_whisper'].includes(name)
+      if (mutating && ((args.contextId != null && args.contextId !== contextId) || (args.taskId != null && args.taskId !== pendingTask?.id))) return err('任务或作画环境已过期，请重新领取任务', 'stale_context')
+      if (name === 'canvas_draw') {
+        const ref = args.targetId ?? args.spaceId
+        const validTask = args.contextId === contextId && typeof args.taskId === 'string' && args.taskId === pendingTask?.id
+        if (!validTask && !(typeof ref === 'string' && ref.startsWith(framePrefix()) && lookupFrame(ref))) return err('落笔缺少当前任务标识或帧，请重新领取任务或申请空位', 'stale_context')
+      }
+      if (name === 'canvas_commit' && (!ownedPreviewId || args.previewId !== ownedPreviewId)) return err('草稿不属于当前作画环境', 'stale_context')
       const h = handlers[name]
       if (!h) return err(`未知工具：${name}`, 'unknown_tool')
       try {
-        return await h(args)
+        const result = await h(args)
+        if (!current()) return err('作画环境已切换', 'stale_context')
+        if (result.error) {
+          ctx.log(name, result.error.message, 'warn')
+          if ((name === 'canvas_draw' || name === 'canvas_commit') && pendingTask && (pendingTask.stage === 'queued' || pendingTask.stage === 'claimed')) taskStatus('claimed', { detail: `上次提交被拒绝：${result.error.message}；可修稿重试` })
+        }
+        return result
       } catch (e) {
         ctx.log(name, `处理器异常：${String(e)}`, 'warn')
         return err(String(e), 'handler_error')
       }
-    },
-  })
+  }
 
   return {
     client,
+    contextId,
+    call,
+    failTask: (reason) => { if (current()) cancelTask(reason, 'failed') },
+    join: () => ({ context: ctx.context ?? 'game', contextId, room: ctx.room?.() ?? ROOM_CODE, seat: meId(), me: { name: ctx.state().seats.find((s) => s.id === meId())?.name } }),
     pushTask: (text) => {
-      pendingTask = { id: uid('task'), text }
-      emit('task', { id: pendingTask.id, text })
+      if (!current()) return ''
+      cancelTask('被新任务替换')
+      spaceCache.clear()
+      pendingTask = { id: uid('task'), text, stage: 'queued', profilePrompt: ctx.profilePrompt?.() ?? '', preservePosition: ctx.preservePosition?.() ?? false }
+      const taskId = pendingTask.id
+      emit('task', { id: taskId, taskId, contextId, text })
+      taskStatus('queued')
+      ctx.patchAgent(meId(), 'thinking')
       ctx.log('task_push', `已派发 · 指令「${text}」`, 'muted')
-      // 45s 没等到 Agent 落笔就把状态灯拨回，防止卡死
-      ctx.later(45000, () => {
-        if (pendingTask) ctx.patchAgent(meId(), 'idle')
-      })
+      taskTimer = setTimeout(() => {
+        if (current() && pendingTask?.id === taskId && (pendingTask.stage === 'queued' || pendingTask.stage === 'claimed')) cancelTask('Agent 45 秒未返回画作，任务已取消', 'failed')
+      }, 45000)
+      return taskId
     },
-    previewResult: (result, previewId) => emit('preview', { result, previewId }),
-    notifyOps: (ops) =>
+    cancelTask: (reason) => { if (current()) cancelTask(reason) },
+    completeTask,
+    previewResult: (result, previewId) => {
+      if (!current() || !ownedPreviewId || (previewId && previewId !== ownedPreviewId)) return
+      emit('preview', { result, previewId: ownedPreviewId })
+      if (result === 'rejected') { cancelTask('玩家揉掉草稿'); return }
+      if (previewTaskId === pendingTask?.id) {
+        clearCompletion()
+        const batch = ownedPreviewBatch
+        if (batch) awaitDrawing(batch, ctx.net?.() ? null : batch.ops.map((op) => op.id))
+      }
+      ownedPreviewId = null
+      ownedPreviewBatch = null
+    },
+    notifyOps: (ops) => {
       emit(
         'ops',
         ops.map((o) => ({ id: o.id, seat: o.seat, author: o.author, tag: o.el.tag, ink: o.ink, box: opBounds(o) })),
-      ),
+      )
+      if (pendingCommit && pendingTask?.id === pendingCommit.taskId && ops.some((op) => op.seat === meId() && op.author === 'agent')) {
+        const { taskId, batch } = pendingCommit
+        pendingCommit = null
+        clearTaskTimer()
+        completionTimer = setTimeout(() => completeTask(taskId), batch.duration + 80)
+      }
+    },
     notifyOpsRemoved: (ids) => emit('ops_removed', { ids }),
-    dispose: () => client.dispose(),
+    dispose: () => {
+      if (disposed) return
+      cancelTask('作画环境已关闭')
+      spaceCache.clear()
+      disposed = true
+    },
   }
+}
+
+export function attachLiveAgent(ctx: LiveCtx, onPeer: (p: LivePeer) => void): LiveHandle {
+  let runtime: AgentRuntime
+  const port = new URLSearchParams(location.search).get('mcp') ?? '5190'
+  const client = new McpClient({
+    url: `ws://127.0.0.1:${port}`,
+    join: () => runtime.join(),
+    onPeer,
+    onCall: (name, args) => runtime.call(name, args),
+    onDown: () => runtime?.failTask('Agent 连接已断开'),
+  })
+  runtime = createAgentRuntime(ctx, client, { contextId: uid('ctx') })
+  return { ...runtime, dispose: () => { runtime.dispose(); client.dispose() } }
 }

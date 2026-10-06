@@ -9,7 +9,7 @@
 ## 0. TL;DR
 
 - 前端 demo：Vite 6 + React 19 + TypeScript strict。其他玩家和 Agent 由 `src/game/simulation.ts` 模拟。
-- **真实 Agent 已可接入（T1 完成）**：`node server/teadraw.mjs mcp` = MCP stdio 服务 + WebSocket 桥（127.0.0.1:5190，零依赖），浏览器经 `src/game/mcpClient.ts` + `src/game/liveAgent.ts` 把"我的 Agent"交给真实 MCP 客户端；桥不在时自动回退本地模拟。协议与坐标契约见 `server/README.md`。
+- **真实 Agent 已可接入（T1 完成）**：`node server/teadraw.mjs mcp` = MCP stdio 服务 + WebSocket 桥（127.0.0.1:5190，零依赖）。App 顶层 `AgentSessionProvider` 常驻一条连接，主菜单即可接入；`liveAgent` 只绑定当前试画/对局环境，换屏不关闭连接。茶宠工作台只接受真实 Agent，桥 ready 与 MCP awake 分开。协议与坐标契约见 `server/README.md`。
 - 所有笔迹（人和 Agent）都是 `Op { el: SvgEl, tf, author }`。Agent 的 SVG 必须经过 `sanitizeSvg`，再由 `buildBatch` 按笔速生成逐笔动画。
 - 游戏状态全部在 `useGame()` 里，UI 只读 `GameState`（契约见 `src/game/gameTypes.ts`）。
 - 舞台固定 1920×1080 并整体缩放：**任何 client 坐标都必须先用 `ui/stage.ts` 换算**。
@@ -58,6 +58,7 @@ src/
     Canvas.tsx         SVG 画布、指针输入、rAF 驱动的远端光标、草稿与标记渲染
     TopBar / ToolDock / AgentBar(GuessBar) / SidePanel / Overlays / TeaPet
   screens/             Home / Lobby / Game / Result（固定构图、键盘导航）
+  agent/               AgentSession（常驻连接）、usePetSandbox（独立试画）、PetWorkbench（风格/调试/记录/连接）、preferences（个人绘画偏好）
   ui/
     Shell.tsx          LayerRoots, Portal, useBack, useHotkeys, Key, Curtain
     stage.ts           stageScale(), toStage(cx, cy)
@@ -128,7 +129,7 @@ server/
 玩家指针 ──Canvas.onDown/Move/Up──▶ finalize() → g.draw(el) ──▶ ops[]（human，静态）
 玩家指引 ──Canvas(tool='guide')──▶ classifyStroke → g.addMark(DrawTarget) → marks[]（≤ MAX_MARKS=3）
 玩家指令 ──AgentBar──▶ g.askAgent(text)
-   ├ 真实链路（live.state = ready|awake）：liveRef.pushTask(text)
+   ├ 真实链路（live.state = awake）：liveRef.pushTask(text)
    │   → Agent 端 tools/call：turn_get_task → canvas_get_targets/find_space → canvas_draw
    │   → liveAgent.canvas_draw：sanitizeSvg → 帧局部坐标→世界 tf → 配额 → preview(ghost)/commit(runBatch)
    │   → 玩家 Tab/Esc → liveRef.previewResult → 事件回执（events_poll / notifications）
@@ -149,6 +150,15 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 - 动画用 CSS 类 `.draw`，配合 `pathLength=1`，以及 `--delay`、`--dur`。**注意**：任何祖先元素都不要带 `.draw` 类，`stroke-dasharray` 会被子元素继承，曾经导致相册缩略图整体变成虚线（传话相册卡片现在用 `k-draw`）。
 - activity 里的 MCP 工具名与真实 MCP 一致：`turn_get_task`、`canvas_get_targets`、`canvas_find_space`、`canvas_snapshot`、`canvas_describe`、`canvas_draw`、`canvas_commit`、`preview_accept`、`preview_reject`、`chat_send`、`guess_submit`、`hint_whisper`、`events_poll`、`room_state`、`task_push`。模拟链路的日志前缀相同，但真实链路下这些日志是**真实调用发生时**才写入的。
 - 联机时人类与 Agent 统一经过 Host 的 `buildAuthorizedOps → applyCommittedOps`，校验当前画手/回合、SVG 属性、几何与墨量，然后广播；Peer 的直接提交和草稿盖章都等待 Host 回显。MCP 角色与座位动态读取，猜词/聊天也向 Host 提交，联机悄悄提示禁用。
+
+### 5.2 主菜单茶宠工作台（2026-10-06）
+- `main.tsx` 挂载 `AgentSessionProvider`；`App` 常驻 `usePetSandbox`，首页绑定独立 640×360 试画纸，大厅/结算绑定 idle，`useGame` 绑定当前正式游戏；只在主动断开/改端口/页面关闭时关闭 WS。
+- 状态分为连接（off/connecting/ready/awake/down）与任务（queued/claimed/preview/drawing/completed/cancelled/failed）；主菜单 badge 来自实际 peer。MCP 初始化只证明客户端在线，测试成功必须经过真实任务、草稿与动画落笔。
+- 五种画法、细节/结构/墨色、配色/构图和可编辑个人提示词存浏览器配置。主菜单任务文本含完整偏好；对局 `turn_get_task.profilePrompt` 冻结发送时偏好。风格不扩大房规权限，不在网页里切换实际 AI 模型。
+- 试画调试单独控制助手/协作、SVG 规则、笔速、墨量和越界/避让；复用真实 SVG 校验与 Op 动画。中央/角落/狭长/引路/锚定指引及人类起笔可测试协作。试画 Op 永不导入房间。
+- 最近 20 次试画保存在当前 App 会话，记录完整指令、起始画布、偏好/限制、实际作品、阶段、耗时、墨量与接收笔迹 JSON 大小；可重试、同题新纸对比、导出 SVG/诊断 JSON。风格配置跨刷新保存，作品历史不承诺跨刷新保存。
+- `contextId + taskId` 及带环境/回合/任务 epoch 的帧标识隔离迟到提交；取消/换屏/换轮废弃旧帧，45 秒无图为失败，工具提交被拒绝允许 Agent 修稿。调用方应把返回标识用于所有修改工具。
+- 回归：`node tools/agent-session-test.mjs`（连接/runtime 状态与隔离），`node tools/pet-workbench-e2e.mjs`（真实 stdio MCP、主菜单试画与切屏），`node tools/net-lobby-e2e.mjs`（正式联机）。工作台组件与样式仅打开时加载。
 
 ## 5.1 局流程（多轮、恢复、结算载荷）
 
@@ -183,7 +193,7 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 | K7 | 两个会话曾经并行改动同一批文件 | — | 开始工作前先确认没有其他会话同时在写 |
 | K8 | 桥只允许一个游戏页面接入；第二个会被拒绝 | `server/teadraw.mjs` join | 多 Agent/多座位是后续工作 |
 | K9 | 助手档下 `canvas_draw(mode:'commit')` 被降级为 preview，Agent 只能等玩家盖章 | `liveAgent.ts` | `canvas_commit` 工具仅协作/托管档可用 |
-| K10 | 真实链路下「重新吩咐」会覆盖未消费的任务；有草稿时仍阻塞 | `useGame.askAgent` | 45s 无响应会自动把状态灯拨回 idle |
+| K10 | 真实链路下「重新吩咐」会取消旧任务；有草稿时仍阻塞 | `useGame.askAgent` / `liveAgent` | 45s 无图清理任务并报告失败；废弃旧任务帧 |
 
 ## 8. 待办任务（按优先级，每项都有验收标准）
 
@@ -224,7 +234,7 @@ Canvas 的 rAF：读 pens.current，根据 batch.timeline 用 getPointAtLength �
 - 中途加入：`hello → seat-assign/roster/snapshot` 注水后继续接收增量；尚无独立持久化增量日志或 Host 迁移。
 - 网络层复用团队已有的 Steam P2P（SpaceWar）组件。
 - `simulation.ts` 只保留为离线模式和测试用。
-- **当前验收**：本地 Mock 生命周期 6 项、TS 客户端协议 7 项、完整菜单双浏览器 33 项，共 46 项通过（2026-10-06），含人/Agent 双向同步、SVG 篡改、猜词者绘图拒绝、双方刷新、猜词轮换、结算及再开。传话联机与真实 Steam 双账号仍为待验收范围。
+- **当前验收**：本地 Mock 生命周期 6 项、TS 客户端协议 7 项、完整菜单双浏览器 36 项，共 49 项通过（2026-10-06），含人/Agent 双向同步、SVG 篡改、猜词者绘图拒绝、双方刷新、猜词轮换、结算、再开及真实 Agent 身份保持。茶宠常驻会话另有 31 项状态/隔离回归和 28 项主菜单 MCP 回归；Sol 真实模型已完成主菜单茶壶试画。传话联机与真实 Steam 双账号仍为待验收范围。
 
 ### T4 音频
 - 新建 `AudioManager`，分 music / sfx / ambient 三条通道，音量接到设置面板。

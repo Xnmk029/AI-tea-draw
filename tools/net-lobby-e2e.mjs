@@ -71,6 +71,8 @@ try {
     await page.key('Enter')
     const task = await agent.tool('turn_get_task')
     check(`${label}由真实MCP领取任务`, task.task?.text === label)
+    const self = await agent.tool('room_state')
+    check(`${label}座位同步保留真实Agent身份`, self.seats.find(seat => seat.id === self.me.seat)?.agent?.name === (page === A ? 'HostTestPet' : 'PeerTestPet'))
     const space = await agent.tool('canvas_find_space', { w: 120, h: 120 })
     const before = page.messages.length
     const draw = await agent.tool('canvas_draw', { svg: '<circle cx="50" cy="50" r="30" fill="none" stroke="#3B3A36" stroke-width="4"/>', spaceId: space.space.id, mode: preview ? 'preview' : 'commit' })

@@ -61,13 +61,15 @@ const state = {
   agentAwake: false,     // MCP initialize 完成
   pending: new Map(),    // id → {resolve, timer}  tools/call 等待游戏回执
   seq: 0,
+  context: null,
 }
 const log = (...a) => console.error('[teadraw]', ...a)
 
 function startBridge(onReady) {
   const http = createServer((req, res) => {
-    res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, name: 'teadraw-bridge', version: VERSION, game: !!state.game, agentAwake: state.agentAwake }))
+    // 环回桥：放开 CORS 让任意本地页面可探活（我的茶宠面板的连接验证走这里）
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+    res.end(JSON.stringify({ ok: true, name: 'teadraw-bridge', version: VERSION, game: !!state.game, agentAwake: state.agentAwake, agentName: AGENT_NAME, agentModel: AGENT_MODEL, room: state.context?.room ?? ROOM, context: state.context?.context ?? null, contextId: state.context?.contextId ?? null }))
   })
   http.on('upgrade', (req, socket) => {
     const key = req.headers['sec-websocket-key']
@@ -149,9 +151,15 @@ function onGameMessage(send, socket, msg) {
       return
     }
     state.game = socket
+    state.context = { context: msg.context ?? 'game', contextId: msg.contextId ?? null, room: msg.room ?? ROOM, seat: msg.seat ?? null }
     socket._isGame = true
     send({ t: 'joined', ok: true, room: msg.room, seat: msg.seat, peer: state.agentAwake ? { state: 'awake', name: AGENT_NAME, model: AGENT_MODEL } : { state: 'ready', name: AGENT_NAME, model: AGENT_MODEL } })
     log(`游戏接入 · room=${msg.room} seat=${msg.seat}（${msg.me?.name ?? '?'}）`)
+    return
+  }
+  if (state.game !== socket) return
+  if (msg.t === 'context') {
+    state.context = { context: msg.context ?? 'idle', contextId: msg.contextId ?? null, room: msg.room ?? null, seat: msg.seat ?? null }
     return
   }
   if (msg.t === 'result') {
@@ -170,8 +178,9 @@ function onGameMessage(send, socket, msg) {
 }
 
 function onGameClose() {
-  if (this === state.game || this._isGame) {
+  if (this === state.game) {
     state.game = null
+    state.context = null
     for (const [, p] of state.pending) { clearTimeout(p.timer); p.resolve({ ok: false, error: { code: 'host_gone', message: '游戏页面已断开' } }) }
     state.pending.clear()
     log('游戏断开')
@@ -181,7 +190,7 @@ function onGameClose() {
 /** Agent 的 tools/call → 转发给浏览器，等回执（30s 超时） */
 function callGame(name, args) {
   return new Promise((resolve) => {
-    if (!state.game || state.game.destroyed) return resolve({ ok: false, error: { code: 'no_game', message: '茶绘页面没有连接 —— 先打开对局并让它连上桥' } })
+    if (!state.game || state.game.destroyed) return resolve({ ok: false, error: { code: 'no_game', message: '茶绘页面没有连接 —— 打开主菜单或对局，并连接 Agent 桥' } })
     const id = `c${++state.seq}`
     const timer = setTimeout(() => {
       state.pending.delete(id)
@@ -207,15 +216,16 @@ const TOOLS = [
       properties: {
         svg: { type: 'string', description: 'SVG 片段（只允许 path line polyline polygon rect circle ellipse 与 <g>）' },
         targetId: { type: 'string' }, spaceId: { type: 'string' },
+        contextId: { type: 'string', description: 'turn_get_task 返回的本次作画环境标识' }, taskId: { type: 'string', description: 'turn_get_task 返回的任务标识；无帧落笔必须同时携带两个标识' },
         repeat: { type: 'boolean' }, fit: { type: 'string', enum: ['contain', 'clip', 'strict'] },
         mode: { type: 'string', enum: ['preview', 'commit'] },
       },
       required: ['svg'],
     },
   },
-  { name: 'canvas_commit', description: '把待审的描红草稿落定（协作/托管档 Agent 自审用；助手档只能等玩家盖章）。', inputSchema: { type: 'object', properties: { previewId: { type: 'string' } }, required: ['previewId'] } },
-  { name: 'chat_send', description: '以 Agent 身份在房间聊天里发言。', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
-  { name: 'guess_submit', description: '猜词方 Agent 提交猜测文本，返回 correct/close/wrong 与得分（经 Agent 猜中得分减半）。', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'canvas_commit', description: '把待审的描红草稿落定（协作/托管档 Agent 自审用；助手档只能等玩家盖章）。', inputSchema: { type: 'object', properties: { previewId: { type: 'string' }, contextId: { type: 'string' }, taskId: { type: 'string' } }, required: ['previewId'] } },
+  { name: 'chat_send', description: '以 Agent 身份在房间聊天里发言。', inputSchema: { type: 'object', properties: { text: { type: 'string' }, contextId: { type: 'string' }, taskId: { type: 'string' } }, required: ['text'] } },
+  { name: 'guess_submit', description: '猜词方 Agent 提交猜测文本，返回 correct/close/wrong 与得分（经 Agent 猜中得分减半）。', inputSchema: { type: 'object', properties: { text: { type: 'string' }, contextId: { type: 'string' }, taskId: { type: 'string' } }, required: ['text'] } },
   { name: 'hint_whisper', description: '猜词方 Agent 向自己的玩家递一条悄悄提示（每轮一次）。', inputSchema: { type: 'object', properties: {} } },
   { name: 'events_poll', description: '增量拉取游戏事件（新任务、草稿被盖章/揉掉、回合、聊天）。', inputSchema: { type: 'object', properties: { since: { type: 'number' } } } },
   { name: 'room_state', description: '房间信息：模式、座位表、房规、Agent 绑定的座位。', inputSchema: { type: 'object', properties: {} } },
